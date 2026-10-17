@@ -1,1 +1,110 @@
-# blackbird4
+# Monoprice Blackbird 4x4 HDMI Matrix for Home Assistant
+
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/docs/faq/custom_repositories)
+[![Validate](https://github.com/thrivestorm2/blackbird4/actions/workflows/validate.yml/badge.svg)](https://github.com/thrivestorm2/blackbird4/actions/workflows/validate.yml)
+
+Control a **Monoprice Blackbird 4K 4x4 HDMI matrix** (developed against PN 39668) from Home Assistant over your local network. Home Assistant's built-in `blackbird` integration only supports the 8x8 model; this one supports the 4x4.
+
+It talks to the same CGI endpoints the matrix's own web page uses, so you don't need a serial cable. If your unit's web interface doesn't answer, it falls back to the raw TCP command port.
+
+## Features
+
+- UI setup (config flow): enter the matrix's IP address.
+- One **media player** per output (`media_player.blackbird_4x4_output_1` …), whose *source* is the input routed to it.
+- One **select** per output (`select.blackbird_4x4_output_1_source` …), handy for dashboards and automations.
+- Custom names for inputs and outputs, e.g. "Apple TV" → "Living Room TV".
+- Services:
+  - `blackbird4.set_all_outputs`: route one input to every output.
+  - `blackbird4.send_command`: send any raw RS-232 command (`PowerOFF.`, `EDID…`) and get the reply back.
+- Local polling (every 10 s by default). Entities go unavailable if the matrix stops answering.
+- Diagnostics download that includes the raw status reply, useful for bug reports.
+
+## Installation
+
+### HACS (recommended)
+
+1. In Home Assistant, open **HACS → ⋮ → Custom repositories**.
+2. Add `https://github.com/thrivestorm2/blackbird4` with category **Integration**.
+3. Search for **Monoprice Blackbird 4x4 HDMI Matrix**, install it, and restart Home Assistant.
+
+### Manual
+
+Copy `custom_components/blackbird4` into your Home Assistant `config/custom_components/` folder and restart.
+
+## Setup
+
+**Settings → Devices & services → Add integration → Monoprice Blackbird 4x4 HDMI Matrix**, then enter:
+
+| Field | Value |
+| --- | --- |
+| Host | The matrix's IP address, e.g. `192.168.1.39`. Give it a DHCP reservation so it doesn't change. |
+| Port | `80` (the web interface) |
+
+To rename inputs and outputs or change the polling interval, open the integration's **Configure** menu. To change the IP later, use **Reconfigure**.
+
+## Examples
+
+```yaml
+# Send the Apple TV (input 2) to the bedroom (output 3)
+action: select.select_option
+target:
+  entity_id: select.blackbird_4x4_output_3_source
+data:
+  option: Apple TV
+
+# Everything shows input 1
+action: blackbird4.set_all_outputs
+data:
+  input: 1
+
+# Raw command, with the reply returned
+action: blackbird4.send_command
+data:
+  command: "Status."
+response_variable: reply
+```
+
+## Troubleshooting
+
+If setup fails with *cannot connect* or *unknown protocol*, or the routes look wrong, run the probe script from any computer on the same network (Python 3, nothing to install):
+
+```sh
+curl -O https://raw.githubusercontent.com/thrivestorm2/blackbird4/main/scripts/probe.py
+python3 probe.py 192.168.1.39            # read-only
+python3 probe.py 192.168.1.39 --switch   # also routes input 1 to output 1
+```
+
+Open an issue and paste the output. It shows exactly what your firmware's web interface and TCP ports reply, so support for it can be added.
+
+To get debug logs:
+
+```yaml
+logger:
+  logs:
+    custom_components.blackbird4: debug
+```
+
+## How it works
+
+| Action | Request |
+| --- | --- |
+| Read routing | `POST /cgi-bin/MUH44TP_getsetparams.cgi` with body `lcc`. The reply is `({'Outputbuttom': ['1','2','3','4'], ...})`, where entry *n* is the input routed to output *n*. |
+| Switch | `POST /cgi-bin/MMX32_Keyvalue.cgi` with body `{CMD=OUT03:02.`, which passes RS-232 commands through. |
+
+The matrix's web server sends malformed HTTP, so the integration uses a small raw-socket HTTP client and needs no third-party Python packages. Credit to [alexyao2015/hass-blackbird24180](https://github.com/alexyao2015/hass-blackbird24180) for documenting these endpoints on the 8x8 model.
+
+## Development
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements_test.txt
+ruff check . && ruff format --check . && pytest
+```
+
+Release checklist: bump `version` in `custom_components/blackbird4/manifest.json`, tag `vX.Y.Z`, and publish a GitHub release (HACS offers releases as versions).
+
+For HACS validation to pass, set the GitHub repository's **description** and **topics** (`home-assistant`, `hacs`, `hacs-integration`, `monoprice`, `hdmi-matrix`) and keep **Issues** enabled.
+
+## License
+
+MIT

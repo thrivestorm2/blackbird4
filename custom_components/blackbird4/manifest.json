@@ -1,0 +1,12 @@
+{
+  "domain": "blackbird4",
+  "name": "Monoprice Blackbird 4x4 HDMI Matrix",
+  "codeowners": ["@thrivestorm2"],
+  "config_flow": true,
+  "documentation": "https://github.com/thrivestorm2/blackbird4",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/thrivestorm2/blackbird4/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

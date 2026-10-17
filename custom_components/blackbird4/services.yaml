@@ -1,0 +1,26 @@
+set_all_outputs:
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: blackbird4
+    input:
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 4
+          mode: box
+
+send_command:
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: blackbird4
+    command:
+      required: true
+      example: "OUT01:02."
+      selector:
+        text:

@@ -1,0 +1,83 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Monoprice Blackbird 4x4",
+        "description": "Enter the address of the matrix's web interface. If the web interface can't be used, nearby TCP control ports are tried automatically.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "IP address or hostname of the matrix, e.g. 192.168.1.39.",
+          "port": "Web interface port (usually 80)."
+        }
+      },
+      "reconfigure": {
+        "title": "Change matrix address",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the matrix. Check the IP address and that it is on the network.",
+      "unknown_protocol": "Something answered at that address but it didn't respond like a Blackbird matrix. Run scripts/probe.py from the repository and open an issue with the output.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This matrix is already configured.",
+      "reconfigure_successful": "The matrix address was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Blackbird 4x4 options",
+        "description": "Name the inputs and outputs (leave blank for the defaults) and set how often the matrix is polled.",
+        "data": {
+          "scan_interval": "Polling interval (seconds)",
+          "input_1": "Input 1 name",
+          "input_2": "Input 2 name",
+          "input_3": "Input 3 name",
+          "input_4": "Input 4 name",
+          "output_1": "Output 1 name",
+          "output_2": "Output 2 name",
+          "output_3": "Output 3 name",
+          "output_4": "Output 4 name"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_all_outputs": {
+      "name": "Set all outputs",
+      "description": "Route one input to every output.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Matrix",
+          "description": "The matrix to control. Optional when only one is configured."
+        },
+        "input": {
+          "name": "Input",
+          "description": "Input number (1-4)."
+        }
+      }
+    },
+    "send_command": {
+      "name": "Send command",
+      "description": "Send a raw RS-232 command (for example OUT01:02. or PowerOFF.) to the matrix and return its reply.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Matrix",
+          "description": "The matrix to control. Optional when only one is configured."
+        },
+        "command": {
+          "name": "Command",
+          "description": "The command; a trailing period is added if missing."
+        }
+      }
+    }
+  }
+}
