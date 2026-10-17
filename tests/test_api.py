@@ -258,9 +258,17 @@ def test_state_from_text_bang() -> None:
 class FakeTerminal:
     """Replies like the B44H70 web UI: /cgi-bin/instr in, /cgi-bin/query out."""
 
-    def __init__(self, routes: dict[int, int], accept_long_form: bool = True) -> None:
+    def __init__(
+        self,
+        routes: dict[int, int],
+        accept_long_form: bool = True,
+        unframed: bool = False,
+    ) -> None:
         self.routes = routes
         self.accept_long_form = accept_long_form
+        # Unframed: no Content-Length, the connection is left open, and an
+        # empty reply buffer gets no response at all.
+        self.unframed = unframed
         self.commands: list[str] = []
         self.buffer = ""
 
@@ -268,6 +276,10 @@ class FakeTerminal:
         line = request.split(b"\r\n", 1)[0].decode()
         if line.startswith("GET /cgi-bin/query "):
             body, self.buffer = self.buffer, ""
+            if self.unframed:
+                if not body:
+                    return b""
+                return b"HTTP/1.1 200 OK\r\n\r\n" + body.encode()
             return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (
                 len(body),
                 body.encode(),
@@ -276,6 +288,8 @@ class FakeTerminal:
             command = unquote_plus(line.split("cmd=", 1)[1].split(" ")[0]).strip()
             self.commands.append(command)
             self.buffer = self._run(command)
+            if self.unframed:
+                return b"HTTP/1.1 200 OK\r\n\r\n"
             return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
         return b"HTTP/1.1 404 Not Found\r\n\r\n"
 
@@ -312,6 +326,21 @@ async def test_web_terminal(device) -> None:
     assert (await client.async_get_state()).outputs[3] == 2
 
     assert "input" in await client.async_send_raw("r av out 0")
+
+
+@pytest.mark.usefixtures("fast_terminal")
+async def test_web_terminal_unframed_keep_alive(
+    device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(WebTerminalTransport, "idle_timeout", 0.05)
+    monkeypatch.setattr(WebTerminalTransport, "query_timeout", 0.2)
+    terminal = FakeTerminal({1: 2, 2: 2, 3: 1, 4: 4}, unframed=True)
+    fake = await device(terminal.reply)
+    fake.keep_open = True
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="web_terminal", timeout=2)
+    assert (await client.async_get_state()).outputs == {1: 2, 2: 2, 3: 1, 4: 4}
+    await client.async_set_output(1, 3)
+    assert terminal.routes[1] == 3
 
 
 @pytest.mark.usefixtures("fast_terminal")
