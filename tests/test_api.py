@@ -19,7 +19,9 @@ from custom_components.blackbird4.api import (
     WebHexTransport,
     WebTerminalTransport,
     async_probe,
+    async_web_ui_command_code,
     build_frame,
+    connection_byte,
     frame_to_hex,
     jquery_encode,
     parse_frames,
@@ -430,7 +432,18 @@ class FakeHexMatrix:
             return b"HTTP/1.1 200 OK\r\n\r\n"
         return b"HTTP/1.1 404 Not Found\r\n\r\n"
 
+    #: Status bytes like the real unit's General tab: every input has a
+    #: source; output 1 has no display.
+    connected_inputs = (1, 2, 3, 4)
+    connected_outputs = (2, 3, 4)
+
     def _run(self, frame: bytes) -> bytes:
+        if frame[2:4] == b"\x01\x04":
+            value = 0xFF if frame[4] in self.connected_inputs else 0x00
+            return build_frame(bytes([0xA5, 0x5B, 0x01, 0x04, frame[4], value]))
+        if frame[2:4] == b"\x01\x05":
+            value = 0x00 if frame[4] in self.connected_outputs else 0xFF
+            return build_frame(bytes([0xA5, 0x5B, 0x01, 0x05, frame[4], value]))
         if frame[2:4] == b"\x02\x01":
             output = frame[4]
             return build_frame(
@@ -483,3 +496,41 @@ async def test_web_hex_raw_command(hex_matrix) -> None:
     matrix.routes[2] = 3
     reply = await client.async_send_raw("a5 5b 02 01 02")
     assert reply == "hex(a5,5b,02,01,02,00,03,00,00,00,00,00,f8)"
+
+
+async def test_web_hex_connections(hex_matrix) -> None:
+    _, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    assert client.supports_connections
+    state = await client.async_get_connections()
+    assert state.inputs == {1: True, 2: True, 3: True, 4: True}
+    assert state.outputs == {1: False, 2: True, 3: True, 4: True}
+    assert state.raw["output_1"] == "ff"
+
+
+def test_connection_byte_positions() -> None:
+    # Some sheets put the status in byte 7 rather than byte 6.
+    frame = build_frame(bytes([0xA5, 0x5B, 0x01, 0x05, 0x02, 0x00, 0xFF]))
+    assert connection_byte([frame], "output", 2) == 0xFF
+    assert connection_byte([frame], "output", 1) is None
+
+
+async def test_web_ui_command_code(device) -> None:
+    pages = {
+        b"GET / ": b'<script src="js/jquery.min.js"></script><script src="js/processor.js"></script>',
+        b"GET /js/jquery.min.js ": b"power power power",
+        b"GET /js/processor.js ": b"function setPower(on){send([0xa5,0x5b,0x08,0x0b,on?0x0f:0xf0]);}",
+    }
+
+    def reply(request: bytes) -> bytes:
+        for prefix, body in pages.items():
+            if request.startswith(prefix):
+                return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (
+                    len(body),
+                    body,
+                )
+        return b"HTTP/1.1 404 Not Found\r\n\r\n"
+
+    fake = await device(reply)
+    code = await async_web_ui_command_code("127.0.0.1", fake.port)
+    assert any("[/js/processor.js]" in snip and "0xa5,0x5b" in snip for snip in code)
+    assert not any("jquery" in snip for snip in code)

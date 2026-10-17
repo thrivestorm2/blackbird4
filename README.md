@@ -12,7 +12,8 @@ It talks to the same CGI endpoints the matrix's own web page uses, so you don't 
 - UI setup (config flow): enter the matrix's IP address.
 - One **media player** per output (`media_player.blackbird_4x4_output_1` …), whose *source* is the input routed to it.
 - One **select** per output (`select.blackbird_4x4_output_1_source` …), handy for dashboards and automations.
-- Custom names for inputs and outputs, e.g. "Apple TV" → "Living Room TV".
+- Connection sensors: whether each input has a source plugged in and each output a display (PN 39668's hex protocol; checked every 60 s).
+- Custom names for inputs and outputs, asked for during setup (optional) and changeable later, e.g. "Apple TV" → "Living Room TV".
 - Services:
   - `blackbird4.set_all_outputs`: route one input to every output.
   - `blackbird4.send_command`: send any raw command in your matrix's command set (`r av out 0!`, `PowerOFF.`, …) and get the reply back.
@@ -41,7 +42,7 @@ Copy `custom_components/blackbird4` into your Home Assistant `config/custom_comp
 | Host | The matrix's IP address, e.g. `192.168.1.39`. Give it a DHCP reservation so it doesn't change. |
 | Port | `80` (the web interface) |
 
-To rename inputs and outputs or change the polling interval, open the integration's **Configure** menu. To change the IP later, use **Reconfigure**.
+After the matrix is found, setup asks for optional input and output names. Leave them blank to keep "Input 1", "Output 1" and so on. To rename them later or change the polling interval, open the integration's **Configure** menu. To change the IP later, use **Reconfigure**.
 
 ## Examples
 
@@ -110,7 +111,7 @@ pip install -r requirements_test.txt
 ruff check . && ruff format --check . && pytest
 ```
 
-Release checklist: bump `version` in `custom_components/blackbird4/manifest.json`, tag `vX.Y.Z`, and publish a GitHub release (HACS offers releases as versions).
+Releases: bump `version` in `custom_components/blackbird4/manifest.json`, merge, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The Release workflow checks that the tag matches the manifest and publishes the GitHub release. HACS installs releases, so a change reaches users only once it's released.
 
 For HACS validation to pass, set the GitHub repository's **description** and **topics** (`home-assistant`, `hacs`, `hacs-integration`, `monoprice`, `hdmi-matrix`) and keep **Issues** enabled.
 

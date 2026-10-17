@@ -30,6 +30,7 @@ def mock_client() -> Generator[AsyncMock]:
             outputs={1: 1, 2: 2, 3: 3, 4: 4}, raw={"Outputbuttom": [1, 2, 3, 4]}
         )
         client.async_send_raw.return_value = "OK"
+        client.supports_connections = False
         yield client
 
 

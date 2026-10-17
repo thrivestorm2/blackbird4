@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 from typing import Any
 
@@ -94,6 +95,25 @@ def _user_schema(host: str = "", port: int = DEFAULT_PORT) -> vol.Schema:
     )
 
 
+def _names_schema(options: Mapping[str, Any]) -> dict[Any, Any]:
+    """Return optional name fields for every input and output."""
+    schema: dict[Any, Any] = {}
+    for key in [input_key(n) for n in INPUTS] + [output_key(n) for n in OUTPUTS]:
+        schema[vol.Optional(key, description={"suggested_value": options.get(key)})] = (
+            str
+        )
+    return schema
+
+
+def _non_blank(user_input: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop blank names so the defaults ("Input 1", ...) apply."""
+    return {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in user_input.items()
+        if not (isinstance(value, str) and not value.strip())
+    }
+
+
 class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for the Blackbird matrix."""
 
@@ -102,6 +122,7 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialise the flow."""
         self._details = ""
+        self._data: dict[str, Any] = {}
 
     async def _async_validate(
         self, user_input: dict[str, Any], errors: dict[str, str]
@@ -145,12 +166,25 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
             )
             self._abort_if_unique_id_configured()
             if data := await self._async_validate(user_input, errors):
-                return self.async_create_entry(title="Blackbird 4x4", data=data)
+                self._data = data
+                return await self.async_step_names()
         return self.async_show_form(
             step_id="user",
             data_schema=self.add_suggested_values_to_schema(_user_schema(), user_input),
             errors=errors,
             description_placeholders={"details": self._details},
+        )
+
+    async def async_step_names(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Optionally name the inputs and outputs; blank keeps the defaults."""
+        if user_input is not None:
+            return self.async_create_entry(
+                title="Blackbird 4x4", data=self._data, options=_non_blank(user_input)
+            )
+        return self.async_show_form(
+            step_id="names", data_schema=vol.Schema(_names_schema({}))
         )
 
     async def async_step_reconfigure(
@@ -189,25 +223,13 @@ class BlackbirdOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
-            # Drop blank names so the defaults ("Input 1", ...) apply.
-            return self.async_create_entry(
-                data={key: value for key, value in user_input.items() if value != ""}
-            )
+            return self.async_create_entry(data=_non_blank(user_input))
         options = self.config_entry.options
         schema: dict[Any, Any] = {
             vol.Required(
                 CONF_SCAN_INTERVAL,
                 default=options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
             ): vol.All(vol.Coerce(int), vol.Range(min=2, max=3600)),
+            **_names_schema(options),
         }
-        for number in INPUTS:
-            key = input_key(number)
-            schema[
-                vol.Optional(key, description={"suggested_value": options.get(key)})
-            ] = str
-        for number in OUTPUTS:
-            key = output_key(number)
-            schema[
-                vol.Optional(key, description={"suggested_value": options.get(key)})
-            ] = str
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

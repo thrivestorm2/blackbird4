@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
@@ -14,7 +15,10 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
 )
 
-from custom_components.blackbird4.api import BlackbirdConnectionError
+from custom_components.blackbird4.api import (
+    BlackbirdConnectionError,
+    ConnectionState,
+)
 from custom_components.blackbird4.const import DOMAIN
 from custom_components.blackbird4.diagnostics import (
     async_get_config_entry_diagnostics,
@@ -121,6 +125,62 @@ async def test_unload(hass: HomeAssistant, loaded) -> None:
 
 
 async def test_diagnostics(hass: HomeAssistant, loaded) -> None:
-    diag = await async_get_config_entry_diagnostics(hass, loaded)
+    with patch(
+        "custom_components.blackbird4.diagnostics.async_web_ui_command_code",
+        return_value=["[/js/x.js] power"],
+    ):
+        diag = await async_get_config_entry_diagnostics(hass, loaded)
+    assert diag["web_ui_command_code"] == ["[/js/x.js] power"]
+    assert diag["connections"] is None
     assert diag["routes"] == {1: 1, 2: 2, 3: 3, 4: 4}
     assert diag["raw_status"] == {"Outputbuttom": [1, 2, 3, 4]}
+
+
+async def test_no_connection_sensors_without_support(
+    hass: HomeAssistant, loaded
+) -> None:
+    assert not hass.states.async_entity_ids("binary_sensor")
+
+
+async def test_connection_sensors(
+    hass: HomeAssistant, config_entry: MockConfigEntry, mock_client
+) -> None:
+    mock_client.supports_connections = True
+    mock_client.async_get_connections.return_value = ConnectionState(
+        inputs={1: True, 2: True, 3: True, 4: False},
+        outputs={1: False, 2: True, 3: True},
+        raw={"output_1": "ff", "output_2": "00"},
+    )
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_1_connected").state == "on"
+    )
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_4_connected").state == "off"
+    )
+    output_1 = hass.states.get("binary_sensor.blackbird_4x4_output_1_connected")
+    assert output_1.state == "off"
+    assert output_1.attributes["status_byte"] == "ff"
+    # Not reported by the matrix.
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_output_4_connected").state
+        == STATE_UNAVAILABLE
+    )
+
+
+async def test_connection_status_failure_does_not_block_setup(
+    hass: HomeAssistant, config_entry: MockConfigEntry, mock_client
+) -> None:
+    mock_client.supports_connections = True
+    mock_client.async_get_connections.side_effect = BlackbirdConnectionError("x")
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("media_player.blackbird_4x4_output_1").state == STATE_ON
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_1_connected").state
+        == STATE_UNAVAILABLE
+    )

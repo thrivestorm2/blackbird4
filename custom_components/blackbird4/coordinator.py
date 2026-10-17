@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import BlackbirdError, BlackbirdMatrix, MatrixState
+from .api import BlackbirdError, BlackbirdMatrix, ConnectionState, MatrixState
 from .const import (
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
@@ -23,6 +23,8 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+CONNECTION_SCAN_INTERVAL = timedelta(seconds=60)
 
 type BlackbirdConfigEntry = ConfigEntry[BlackbirdCoordinator]
 
@@ -49,6 +51,11 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
             ),
         )
         self.client = client
+        self.connections: ConnectionCoordinator | None = (
+            ConnectionCoordinator(hass, entry, client)
+            if client.supports_connections
+            else None
+        )
 
     async def _async_update_data(self) -> MatrixState:
         try:
@@ -102,3 +109,35 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
             self.async_set_updated_data(
                 replace(self.data, outputs={**self.data.outputs, **routes})
             )
+
+
+class ConnectionCoordinator(DataUpdateCoordinator[ConnectionState]):
+    """Poll which ports have something plugged in.
+
+    Kept separate and slow: it costs eight round trips, and cables change
+    far less often than routes.
+    """
+
+    config_entry: BlackbirdConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: BlackbirdConfigEntry,
+        client: BlackbirdMatrix,
+    ) -> None:
+        """Initialise the coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=f"{DOMAIN} connections",
+            update_interval=CONNECTION_SCAN_INTERVAL,
+        )
+        self.client = client
+
+    async def _async_update_data(self) -> ConnectionState:
+        try:
+            return await self.client.async_get_connections()
+        except BlackbirdError as err:
+            raise UpdateFailed(f"Error reading connection status: {err}") from err

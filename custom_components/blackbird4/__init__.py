@@ -12,7 +12,11 @@ from .const import CONF_PROTOCOL, DOMAIN
 from .coordinator import BlackbirdConfigEntry, BlackbirdCoordinator
 from .services import async_setup_services
 
-PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.SELECT]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.MEDIA_PLAYER,
+    Platform.SELECT,
+]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -32,6 +36,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: BlackbirdConfigEntry) ->
     )
     coordinator = BlackbirdCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()
+    if coordinator.connections is not None:
+        # Connection status is a nice-to-have: don't block setup on it.
+        await coordinator.connections.async_refresh()
     entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
