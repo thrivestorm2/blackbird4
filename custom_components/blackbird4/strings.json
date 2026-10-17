@@ -68,7 +68,7 @@
     },
     "send_command": {
       "name": "Send command",
-      "description": "Send a raw command in the matrix's own command set and return its reply, for example r av out 0! (PN 39668), OUT01:02. (older Blackbird firmware), or a JSON command on /cgi-bin/instr JSON firmware.",
+      "description": "Send a raw command in the matrix's own command set and return its reply, for example a5 5b 02 01 01 (PN 39668 hex frame, checksum added automatically), r av out 0!, or OUT01:02. on older Blackbird firmware.",
       "fields": {
         "config_entry_id": {
           "name": "Matrix",

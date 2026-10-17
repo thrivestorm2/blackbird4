@@ -92,7 +92,8 @@ Blackbird matrices are rebadged OEM hardware, and the protocol depends on the fi
 | Protocol | Read routing | Switch |
 | --- | --- | --- |
 | `http` | `POST /cgi-bin/MUH44TP_getsetparams.cgi`, body `lcc`. The reply is `({'Outputbuttom': ['1','2','3','4'], ...})`, where entry *n* is the input routed to output *n*. | `POST /cgi-bin/MMX32_Keyvalue.cgi`, body `{CMD=OUT03:02.` |
-| `web_terminal` (PN 39668, web UI "B44H70") | `GET /cgi-bin/instr?cmd=r+av+out+0!%0D`, then `GET /cgi-bin/query` for the reply, e.g. `input 2 -> output 1` | `s in 2 av out 1!` (falls back to `s 2 av 1!`) |
+| `web_hex` (PN 39668, web UI "B44H70") | `GET /cgi-bin/submit?cmd=hex(a5,5b,02,01,<out>,00,…,<sum>)` per output, then `GET /cgi-bin/query`. The reply `hex(a5,5b,02,01,<out>,00,<in>,…)` carries the input in byte 7. | `hex(a5,5b,02,03,<in>,00,<out>,…)`. The byte order is checked on the first switch, because vendor sheets disagree. |
+| `web_terminal` | `GET /cgi-bin/instr?cmd=r+av+out+0!%0D`, then `GET /cgi-bin/query` for the reply, e.g. `input 2 -> output 1` | `s in 2 av out 1!` (falls back to `s 2 av 1!`) |
 | `json` | `POST /cgi-bin/instr`, body `{"comhead":"get video status","language":0}`. The reply's `allsource` list gives the input for each output. | `{"comhead":"video switch","language":0,"source":[3,2]}` |
 | `tcp` | `Status.` on TCP port 23/4001/8000/5000 | `OUT03:02.` |
 | `tcp_bang` | `r av out 0!` on TCP port 8000/23/4001/5000 | `s in 2 av out 1!` |

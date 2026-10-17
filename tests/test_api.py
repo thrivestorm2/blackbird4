@@ -11,16 +11,24 @@ from urllib.parse import unquote_plus
 import pytest
 
 from custom_components.blackbird4.api import (
+    SWITCH_INPUT_FIRST,
+    SWITCH_OUTPUT_FIRST,
     BlackbirdConnectionError,
     BlackbirdMatrix,
     BlackbirdProtocolError,
+    WebHexTransport,
     WebTerminalTransport,
     async_probe,
+    build_frame,
+    frame_to_hex,
     jquery_encode,
+    parse_frames,
     parse_http_response,
     parse_status_body,
+    query_frame,
     route_command,
     state_from_text,
+    switch_frame,
 )
 
 pytestmark = pytest.mark.usefixtures("socket_enabled")
@@ -368,3 +376,110 @@ async def test_tcp_bang(device) -> None:
     assert fake.received[0] == b"r av out 0!\r\n"
     await client.async_set_output(1, 2)
     assert fake.received[1] == b"s in 2 av out 1!\r\n"
+
+
+# The frame the real PN 39668 had in its reply buffer.
+SEEN_FRAME = "hex(a5,5b,01,03,01,00,12,00,00,00,00,00,e9)"
+
+
+def test_frames() -> None:
+    assert frame_to_hex(query_frame(1)) == "hex(a5,5b,02,01,01,00,00,00,00,00,00,00,fc)"
+    # Vendor sheet example: A5 5B 02 03 02 00 01 00 00 00 00 00 F8.
+    assert (
+        switch_frame(1, 2, SWITCH_INPUT_FIRST).hex()
+        == "a55b0203020001" + "00" * 5 + "f8"
+    )
+    assert switch_frame(2, 1, SWITCH_OUTPUT_FIRST) == switch_frame(
+        1, 2, SWITCH_INPUT_FIRST
+    )
+    assert parse_frames(SEEN_FRAME) == [
+        bytes.fromhex("a55b010301001200000000" + "00e9")
+    ]
+    assert parse_frames("hex(a5,5b,01,03,01,00,12,00,00,00,00,00,e8)") == []
+    assert build_frame(bytes.fromhex("a55b020101"))[-1] == 0xFC
+
+
+class FakeHexMatrix:
+    """Mimics the B44H70 web UI: /cgi-bin/submit in, /cgi-bin/query out.
+
+    The reply buffer keeps the last reply (it is not cleared by reading).
+    """
+
+    def __init__(self, routes: dict[int, int], order: str) -> None:
+        self.routes = routes
+        self.order = order
+        self.frames: list[bytes] = []
+        self.buffer = SEEN_FRAME
+
+    def reply(self, request: bytes) -> bytes:
+        line = request.split(b"\r\n", 1)[0].decode()
+        if line.startswith("GET /cgi-bin/query "):
+            body = self.buffer.encode()
+            chunk = f"{len(body):X}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+            return (
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                b"Transfer-Encoding: chunked\r\ncontent-type: text/plain\r\n\r\n"
+                + chunk
+            )
+        if line.startswith("GET /cgi-bin/submit?cmd="):
+            (frame,) = parse_frames(
+                unquote_plus(line.split("cmd=", 1)[1].split(" ")[0])
+            )
+            self.frames.append(frame)
+            self.buffer = frame_to_hex(self._run(frame))
+            return b"HTTP/1.1 200 OK\r\n\r\n"
+        return b"HTTP/1.1 404 Not Found\r\n\r\n"
+
+    def _run(self, frame: bytes) -> bytes:
+        if frame[2:4] == b"\x02\x01":
+            output = frame[4]
+            return build_frame(
+                bytes([0xA5, 0x5B, 0x02, 0x01, output, 0, self.routes[output]])
+            )
+        if frame[2:4] == b"\x02\x03":
+            if self.order == SWITCH_INPUT_FIRST:
+                input_, output = frame[4], frame[6]
+            else:
+                output, input_ = frame[4], frame[6]
+            self.routes[output] = input_
+        return frame
+
+
+@pytest.fixture
+async def hex_matrix(device, fast_terminal, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(WebHexTransport, "idle_timeout", 0.05)
+
+    async def _start(order: str) -> tuple[FakeHexMatrix, BlackbirdMatrix]:
+        matrix = FakeHexMatrix({1: 1, 2: 2, 3: 3, 4: 4}, order)
+        fake = await device(matrix.reply)
+        return matrix, BlackbirdMatrix("127.0.0.1", fake.port, protocol="web_hex")
+
+    return _start
+
+
+async def test_web_hex_state(hex_matrix) -> None:
+    matrix, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    matrix.routes.update({1: 2, 3: 4})
+    assert (await client.async_get_state()).outputs == {1: 2, 2: 2, 3: 4, 4: 4}
+    assert [f[4] for f in matrix.frames] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("order", [SWITCH_INPUT_FIRST, SWITCH_OUTPUT_FIRST])
+async def test_web_hex_switch_learns_order(hex_matrix, order: str) -> None:
+    matrix, client = await hex_matrix(order)
+    await client.async_set_output(1, 3)
+    # Only output 1 changed, whichever byte order the matrix uses.
+    assert matrix.routes == {1: 3, 2: 2, 3: 3, 4: 4}
+    assert client._transport.switch_order == order
+
+    sent = len(matrix.frames)
+    await client.async_set_output(2, 4)
+    assert matrix.routes == {1: 3, 2: 4, 3: 3, 4: 4}
+    assert len(matrix.frames) == sent + 1  # order known: just the switch
+
+
+async def test_web_hex_raw_command(hex_matrix) -> None:
+    matrix, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    matrix.routes[2] = 3
+    reply = await client.async_send_raw("a5 5b 02 01 02")
+    assert reply == "hex(a5,5b,02,01,02,00,03,00,00,00,00,00,f8)"

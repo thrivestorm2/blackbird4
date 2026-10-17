@@ -22,6 +22,12 @@ Commands go out as ``GET /cgi-bin/instr?cmd=<command>\\r`` and replies are
 read back from ``GET /cgi-bin/query``. This firmware (seen on PN 39668, web
 UI titled "B44H70") uses the "bang" command set: ``s in 1 av out 2!``.
 
+``web_hex``: the same web UI terminal, but carrying the 13-byte binary
+frames that start ``A5 5B`` (PN 39668 again): frames go out as
+``GET /cgi-bin/submit?cmd=hex(a5,5b,...)`` and replies come back from
+``/cgi-bin/query`` in the same ``hex(...)`` form. The last byte of a frame
+makes the sum of all 13 bytes 0 (mod 256).
+
 ``tcp`` / ``tcp_bang``: the RS-232 command set on a raw TCP port, in the
 classic ``OUT01:02.`` form or the bang form.
 """
@@ -51,6 +57,8 @@ WEB_TERMINAL_QUERY_PATH = "/cgi-bin/query"
 PROTOCOL_HTTP = "http"
 PROTOCOL_JSON = "json"
 PROTOCOL_WEB_TERMINAL = "web_terminal"
+PROTOCOL_WEB_HEX = "web_hex"
+WEB_HEX_SEND_PATH = "/cgi-bin/submit"
 PROTOCOL_TCP = "tcp"
 PROTOCOL_TCP_BANG = "tcp_bang"
 
@@ -395,6 +403,67 @@ class JsonTransport(HttpTransport):
             raise BlackbirdProtocolError(f"Matrix rejected the switch: {reply}")
 
 
+FRAME_HEADER = b"\xa5\x5b"
+FRAME_LENGTH = 13
+_HEX_GROUP_RE = re.compile(r"hex\(([0-9a-fA-F,\s]*)\)")
+
+# Byte order of the switch frame's port bytes. Vendor sheets disagree on
+# whether byte 5 is the input or the output, so it is learned at runtime.
+SWITCH_INPUT_FIRST = "input_first"
+SWITCH_OUTPUT_FIRST = "output_first"
+
+
+def build_frame(body: bytes) -> bytes:
+    """Pad a frame body to 12 bytes and append its checksum byte."""
+    body = body.ljust(FRAME_LENGTH - 1, b"\x00")
+    return body + bytes([-sum(body) & 0xFF])
+
+
+def frame_to_hex(frame: bytes) -> str:
+    """Return a frame in the web UI's ``hex(a5,5b,...)`` notation."""
+    return "hex(" + ",".join(f"{byte:02x}" for byte in frame) + ")"
+
+
+def query_frame(output: int) -> bytes:
+    """Return the frame asking which input feeds ``output``."""
+    return build_frame(bytes([0xA5, 0x5B, 0x02, 0x01, output]))
+
+
+def switch_frame(output: int, input_: int, order: str) -> bytes:
+    """Return the frame routing ``input_`` to ``output``."""
+    first, second = (
+        (input_, output) if order == SWITCH_INPUT_FIRST else (output, input_)
+    )
+    return build_frame(bytes([0xA5, 0x5B, 0x02, 0x03, first, 0x00, second]))
+
+
+def parse_frames(text: str) -> list[bytes]:
+    """Return the valid A5 5B frames in ``hex(...)`` reply text, oldest first."""
+    data = bytearray()
+    for group in _HEX_GROUP_RE.findall(text):
+        data += bytes(
+            int(token, 16) for token in re.findall(r"[0-9a-fA-F]{1,2}", group)
+        )
+    frames: list[bytes] = []
+    index = 0
+    while index + FRAME_LENGTH <= len(data):
+        candidate = bytes(data[index : index + FRAME_LENGTH])
+        if candidate.startswith(FRAME_HEADER) and sum(candidate) & 0xFF == 0:
+            frames.append(candidate)
+            index += FRAME_LENGTH
+        else:
+            index += 1
+    return frames
+
+
+def routed_input(frames: list[bytes], output: int) -> int | None:
+    """Return the input reported for ``output`` by the newest matching reply."""
+    for frame in reversed(frames):
+        if frame[2:4] == b"\x02\x01" and frame[4] == output:
+            return frame[6]
+    return None
+
+
 async def _bang_set_output(transport: Any, output: int, input_: int) -> None:
     """Route with the bang command set, falling back to the short form."""
     for command in bang_route_commands(output, input_):
@@ -460,6 +529,104 @@ class WebTerminalTransport(HttpTransport):
     async def set_output(self, output: int, input_: int) -> None:
         """Route ``input_`` to ``output``."""
         await _bang_set_output(self, output, input_)
+
+
+class WebHexTransport(WebTerminalTransport):
+    """Send A5 5B binary frames through the web UI's terminal endpoints."""
+
+    protocol = PROTOCOL_WEB_HEX
+    num_outputs = 4
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        """Initialise the transport."""
+        super().__init__(host, port, timeout)
+        self.switch_order: str | None = None
+
+    async def exchange_frame(self, frame: bytes, output: int | None = None) -> str:
+        """Send a frame and return the reply text.
+
+        The reply buffer keeps its last content, so wait for it to change.
+        When ``output`` is given, also wait for a routing reply for that
+        output.
+        """
+        before = await self._query()
+        with contextlib.suppress(BlackbirdTimeoutError):
+            parse_http_response(
+                await self.request(
+                    "GET",
+                    f"{WEB_HEX_SEND_PATH}?cmd={jquery_encode(frame_to_hex(frame))}",
+                )
+            )
+        reply = before
+        for _ in range(self.reply_polls):
+            await asyncio.sleep(self.reply_delay)
+            reply = await self._query()
+            if reply != before and (
+                output is None or routed_input(parse_frames(reply), output) is not None
+            ):
+                break
+        return reply
+
+    async def query_output(self, output: int) -> int | None:
+        """Return the input routed to ``output``, or None if it didn't say."""
+        return routed_input(
+            parse_frames(await self.exchange_frame(query_frame(output), output)),
+            output,
+        )
+
+    async def get_state(self) -> MatrixState:
+        """Return the current routing, one query per output."""
+        state = MatrixState(raw=[])
+        for output in range(1, self.num_outputs + 1):
+            reply = await self.exchange_frame(query_frame(output), output)
+            state.raw.append(reply)
+            if (input_ := routed_input(parse_frames(reply), output)) is not None:
+                state.outputs[output] = input_
+        if not state.outputs:
+            raise BlackbirdProtocolError(
+                f"No routing replies; last reply: {state.raw[-1][:200]!r}"
+            )
+        return state
+
+    async def send(self, command: str) -> str:
+        """Send a raw frame given as hex bytes; the checksum is added if missing."""
+        data = bytes(int(token, 16) for token in re.findall(r"[0-9a-fA-F]{2}", command))
+        if len(data) < FRAME_LENGTH:
+            data = build_frame(data)
+        if len(data) != FRAME_LENGTH or not data.startswith(FRAME_HEADER):
+            raise BlackbirdProtocolError(
+                "Expected a hex frame such as a5 5b 02 01 01 00 00 00 00 00 00 00"
+            )
+        return await self.exchange_frame(data)
+
+    async def _verify(self, output: int) -> int | None:
+        # Read another output first so a stale reply for this one can't match.
+        await self.query_output(output % self.num_outputs + 1)
+        return await self.query_output(output)
+
+    async def set_output(self, output: int, input_: int) -> None:
+        """Route ``input_`` to ``output``, learning the frame's byte order once."""
+        if self.switch_order is not None:
+            await self.exchange_frame(switch_frame(output, input_, self.switch_order))
+            return
+        before = (await self.get_state()).outputs
+        await self.exchange_frame(switch_frame(output, input_, SWITCH_INPUT_FIRST))
+        if await self._verify(output) == input_:
+            self.switch_order = SWITCH_INPUT_FIRST
+            return
+        # The frame meant "output first", so it routed input `output` to
+        # output `input_`. Put that output back, then make the real switch.
+        self.switch_order = SWITCH_OUTPUT_FIRST
+        if (previous := before.get(input_)) is not None:
+            await self.exchange_frame(
+                switch_frame(input_, previous, SWITCH_OUTPUT_FIRST)
+            )
+        await self.exchange_frame(switch_frame(output, input_, SWITCH_OUTPUT_FIRST))
+        if await self._verify(output) != input_:
+            self.switch_order = None
+            raise BlackbirdProtocolError(
+                f"Output {output} did not switch to input {input_}"
+            )
 
 
 class TcpTransport:
@@ -546,6 +713,7 @@ class BlackbirdMatrix:
                 PROTOCOL_TCP: TcpTransport,
                 PROTOCOL_JSON: JsonTransport,
                 PROTOCOL_WEB_TERMINAL: WebTerminalTransport,
+                PROTOCOL_WEB_HEX: WebHexTransport,
             }.get(protocol, HttpTransport)
             self._transport = transport_cls(host, port, timeout)
         self._lock = asyncio.Lock()
@@ -691,6 +859,15 @@ async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:
             lines.append(f"Raw GET {path}: {_snippet(head, 300) or '(empty)'}")
         except BlackbirdError as err:
             lines.append(f"Raw GET {path}: {type(err).__name__}: {err}")
+    hex_terminal = WebHexTransport(host, port, timeout)
+    try:
+        reply = await hex_terminal.exchange_frame(query_frame(1), 1)
+        lines.append(
+            f"Hex query output 1 {frame_to_hex(query_frame(1))}: "
+            f"{_snippet(reply, 400) or '(no reply)'}"
+        )
+    except BlackbirdError as err:
+        lines.append(f"Hex query output 1: {type(err).__name__}: {err}")
     terminal = WebTerminalTransport(host, port, timeout)
     try:
         reply = await terminal.exchange(BANG_STATUS)
