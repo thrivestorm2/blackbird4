@@ -20,6 +20,7 @@ from .api import (
     PROTOCOL_JSON,
     PROTOCOL_TCP,
     PROTOCOL_TCP_BANG,
+    PROTOCOL_WEB_HEX,
     PROTOCOL_WEB_TERMINAL,
     BlackbirdConnectionError,
     BlackbirdError,
@@ -56,6 +57,7 @@ async def async_detect(host: str, port: int) -> dict[str, Any]:
     answered = False
     candidates = [
         (PROTOCOL_HTTP, port),
+        (PROTOCOL_WEB_HEX, port),
         (PROTOCOL_WEB_TERMINAL, port),
         (PROTOCOL_JSON, port),
     ]

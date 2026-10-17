@@ -21,6 +21,6 @@ send_command:
           integration: blackbird4
     command:
       required: true
-      example: "r av out 0!"
+      example: "a5 5b 02 01 01"
       selector:
         text:

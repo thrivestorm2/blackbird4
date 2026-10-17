@@ -203,3 +203,19 @@ async def test_user_flow_detects_web_terminal(hass: HomeAssistant, mock_client) 
         "port": 80,
         "protocol": "web_terminal",
     }
+
+
+async def test_user_flow_detects_web_hex(hass: HomeAssistant, mock_client) -> None:
+    def behaviour(protocol, port):
+        if protocol == "web_hex":
+            return MatrixState({1: 1})
+        return BlackbirdProtocolError("nope")
+
+    result = await _start(hass)
+    with patch(DETECT_CLIENT, _client_cls(behaviour)):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"host": "192.168.1.39", "port": 80}
+        )
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"]["protocol"] == "web_hex"
