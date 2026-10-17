@@ -138,7 +138,11 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             user_input[CONF_HOST] = user_input[CONF_HOST].strip()
-            await self.async_set_unique_id(user_input[CONF_HOST])
+            # Don't let an earlier, abandoned attempt for this address block
+            # a retry; the entry's unique ID still prevents duplicates.
+            await self.async_set_unique_id(
+                user_input[CONF_HOST], raise_on_progress=False
+            )
             self._abort_if_unique_id_configured()
             if data := await self._async_validate(user_input, errors):
                 return self.async_create_entry(title="Blackbird 4x4", data=data)
