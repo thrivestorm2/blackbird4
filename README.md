@@ -111,7 +111,7 @@ pip install -r requirements_test.txt
 ruff check . && ruff format --check . && pytest
 ```
 
-Releases: bump `version` in `custom_components/blackbird4/manifest.json`, merge, then push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The Release workflow checks that the tag matches the manifest and publishes the GitHub release. HACS installs releases, so a change reaches users only once it's released.
+Releases: bump `version` in `custom_components/blackbird4/manifest.json` and merge to `main`. The Release workflow then publishes a `v<version>` GitHub release, tag included, unless that version is already released. HACS installs releases, so a change reaches users only once its version is bumped.
 
 For HACS validation to pass, set the GitHub repository's **description** and **topics** (`home-assistant`, `hacs`, `hacs-integration`, `monoprice`, `hdmi-matrix`) and keep **Issues** enabled.
 
