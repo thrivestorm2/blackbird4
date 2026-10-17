@@ -41,8 +41,20 @@ class BlackbirdOutputPlayer(BlackbirdOutputEntity, MediaPlayerEntity):
         self._attr_source_list = coordinator.input_names
 
     @property
+    def available(self) -> bool:
+        """Stay available while the matrix is off, to show it as off."""
+        if (
+            self.coordinator.last_update_success
+            and self.coordinator.data.power is False
+        ):
+            return True
+        return super().available
+
+    @property
     def state(self) -> MediaPlayerState:
-        """The matrix is always on while it responds."""
+        """Off while the matrix is powered off, otherwise on."""
+        if self.coordinator.data.power is False:
+            return MediaPlayerState.OFF
         return MediaPlayerState.ON
 
     @property

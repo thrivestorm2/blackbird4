@@ -7,8 +7,9 @@ from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_ON, STATE_UNAVAILABLE
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -19,6 +20,7 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.blackbird4.api import (
     BlackbirdConnectionError,
     ConnectionState,
+    MatrixState,
 )
 from custom_components.blackbird4.const import DOMAIN
 from custom_components.blackbird4.diagnostics import (
@@ -280,3 +282,64 @@ async def test_upgrade_keeps_entity_ids(
     assert hass.states.get("select.blackbird_4x4_output_1_source") is not None
     assert hass.states.get("media_player.blackbird_4x4_output_1") is None
     assert config_entry.options == {}
+
+
+async def test_power_and_beep_switches(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_client,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    mock_client.supports_power = True
+    mock_client.async_get_state.return_value = MatrixState(
+        outputs={1: 1, 2: 2, 3: 3, 4: 4}, power=True
+    )
+    mock_client.async_get_connections.return_value = ConnectionState(beep=True)
+    await _setup_with_connections(hass, config_entry, mock_client, freezer)
+
+    assert hass.states.get("switch.blackbird_4x4_power").state == STATE_ON
+    assert hass.states.get("switch.blackbird_4x4_beep").state == STATE_ON
+    assert ("beep", 0) in mock_client.async_get_connections.await_args.args[0]
+
+    await hass.services.async_call(
+        "switch", "turn_off", {"entity_id": "switch.blackbird_4x4_beep"}, blocking=True
+    )
+    mock_client.async_set_beep.assert_awaited_once_with(False)
+    assert hass.states.get("switch.blackbird_4x4_beep").state == STATE_OFF
+
+    await hass.services.async_call(
+        "switch", "turn_off", {"entity_id": "switch.blackbird_4x4_power"}, blocking=True
+    )
+    mock_client.async_set_power.assert_awaited_once_with(False)
+    assert hass.states.get("switch.blackbird_4x4_power").state == STATE_OFF
+    # Outputs show as off, not unavailable; source selects can't be used.
+    assert hass.states.get("media_player.blackbird_4x4_output_1").state == STATE_OFF
+    assert (
+        hass.states.get("select.blackbird_4x4_output_1_source").state
+        == STATE_UNAVAILABLE
+    )
+    with pytest.raises(HomeAssistantError, match="powered off"):
+        await hass.services.async_call(
+            DOMAIN, "set_all_outputs", {"input": 2}, blocking=True
+        )
+    mock_client.async_set_all.assert_not_awaited()
+
+
+async def test_powered_off_at_startup(
+    hass: HomeAssistant, config_entry: MockConfigEntry, mock_client
+) -> None:
+    mock_client.supports_power = True
+    mock_client.async_get_state.return_value = MatrixState(power=False)
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("switch.blackbird_4x4_power").state == STATE_OFF
+    assert hass.states.get("media_player.blackbird_4x4_output_1").state == STATE_OFF
+    assert (
+        hass.states.get("select.blackbird_4x4_output_1_source").state
+        == STATE_UNAVAILABLE
+    )
+
+
+async def test_no_switches_without_support(hass: HomeAssistant, loaded) -> None:
+    assert not hass.states.async_entity_ids("switch")

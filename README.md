@@ -12,6 +12,7 @@ It talks to the same CGI endpoints the matrix's own web page uses, so you don't 
 - UI setup (config flow): enter the matrix's IP address.
 - One **media player** per output (`media_player.blackbird_4x4_output_1` …), whose *source* is the input routed to it.
 - One **select** per output (`select.blackbird_4x4_output_1_source` …), handy for dashboards and automations.
+- Power switch for the whole matrix, and a beep switch for the front-panel beep (PN 39668's hex protocol). While the matrix is off, its outputs show as off.
 - Connection sensors: whether each input has a source plugged in and each output a display (PN 39668's hex protocol; checked every 60 s).
 - Custom names for inputs and outputs, asked for during setup (optional) and changeable later, e.g. "Apple TV" → "Living Room TV".
 - Services:

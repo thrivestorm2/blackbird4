@@ -31,6 +31,7 @@ def mock_client() -> Generator[AsyncMock]:
         )
         client.async_send_raw.return_value = "OK"
         client.supports_connections = False
+        client.supports_power = False
         yield client
 
 
