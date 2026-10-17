@@ -11,8 +11,12 @@ from urllib.parse import unquote_plus
 import pytest
 
 from custom_components.blackbird4.api import (
-    SWITCH_INPUT_FIRST,
-    SWITCH_OUTPUT_FIRST,
+    BEEP_OFF_FRAME,
+    BEEP_ON_FRAME,
+    GET_BEEP_FRAME,
+    GET_POWER_FRAME,
+    POWER_OFF_FRAME,
+    POWER_ON_FRAME,
     BlackbirdConnectionError,
     BlackbirdMatrix,
     BlackbirdProtocolError,
@@ -386,14 +390,8 @@ SEEN_FRAME = "hex(a5,5b,01,03,01,00,12,00,00,00,00,00,e9)"
 
 def test_frames() -> None:
     assert frame_to_hex(query_frame(1)) == "hex(a5,5b,02,01,01,00,00,00,00,00,00,00,fc)"
-    # Vendor sheet example: A5 5B 02 03 02 00 01 00 00 00 00 00 F8.
-    assert (
-        switch_frame(1, 2, SWITCH_INPUT_FIRST).hex()
-        == "a55b0203020001" + "00" * 5 + "f8"
-    )
-    assert switch_frame(2, 1, SWITCH_OUTPUT_FIRST) == switch_frame(
-        1, 2, SWITCH_INPUT_FIRST
-    )
+    # Input byte first, as the device's web UI builds it (input 2 -> output 1).
+    assert switch_frame(1, 2).hex() == "a55b0203020001" + "00" * 5 + "f8"
     assert parse_frames(SEEN_FRAME) == [
         bytes.fromhex("a55b010301001200000000" + "00e9")
     ]
@@ -401,15 +399,40 @@ def test_frames() -> None:
     assert build_frame(bytes.fromhex("a55b020101"))[-1] == 0xFC
 
 
+def test_power_and_beep_frames_match_web_ui() -> None:
+    # Literal strings from the PN 39668's js/processor.js.
+    assert frame_to_hex(POWER_ON_FRAME) == "hex(a5,5b,08,0b,0f,00,00,00,00,00,00,00,de)"
+    assert (
+        frame_to_hex(POWER_OFF_FRAME) == "hex(a5,5b,08,0b,f0,00,00,00,00,00,00,00,fd)"
+    )
+    assert (
+        frame_to_hex(GET_POWER_FRAME) == "hex(a5,5b,08,0c,00,00,00,00,00,00,00,00,ec)"
+    )
+    assert frame_to_hex(BEEP_ON_FRAME) == "hex(a5,5b,06,01,0f,00,00,00,00,00,00,00,ea)"
+    assert frame_to_hex(BEEP_OFF_FRAME) == "hex(a5,5b,06,01,f0,00,00,00,00,00,00,00,09)"
+    assert frame_to_hex(GET_BEEP_FRAME) == "hex(a5,5b,01,0b,00,00,00,00,00,00,00,00,f4)"
+
+
+def _frame(*body: int) -> bytes:
+    return build_frame(bytes([0xA5, 0x5B, *body]))
+
+
 class FakeHexMatrix:
-    """Mimics the B44H70 web UI: /cgi-bin/submit in, /cgi-bin/query out.
+    """Mimics the PN 39668 web UI: /cgi-bin/submit in, /cgi-bin/query out.
 
     The reply buffer keeps the last reply (it is not cleared by reading).
+    While powered off, every command is answered with "power off".
     """
 
-    def __init__(self, routes: dict[int, int], order: str) -> None:
+    #: Like the real unit's General tab: every input has a source; output 1
+    #: has no display. 00 means connected on this firmware.
+    connected_inputs = (1, 2, 3, 4)
+    connected_outputs = (2, 3, 4)
+
+    def __init__(self, routes: dict[int, int]) -> None:
         self.routes = routes
-        self.order = order
+        self.power = True
+        self.beep = True
         self.frames: list[bytes] = []
         self.buffer = SEEN_FRAME
 
@@ -432,29 +455,32 @@ class FakeHexMatrix:
             return b"HTTP/1.1 200 OK\r\n\r\n"
         return b"HTTP/1.1 404 Not Found\r\n\r\n"
 
-    #: Status bytes like the real unit's General tab: every input has a
-    #: source; output 1 has no display.
-    connected_inputs = (1, 2, 3, 4)
-    connected_outputs = (2, 3, 4)
-
     def _run(self, frame: bytes) -> bytes:
-        if frame[2:4] == b"\x01\x04":
-            value = 0xFF if frame[4] in self.connected_inputs else 0x00
-            return build_frame(bytes([0xA5, 0x5B, 0x01, 0x04, frame[4], value]))
-        if frame[2:4] == b"\x01\x05":
-            value = 0x00 if frame[4] in self.connected_outputs else 0xFF
-            return build_frame(bytes([0xA5, 0x5B, 0x01, 0x05, frame[4], value]))
-        if frame[2:4] == b"\x02\x01":
-            output = frame[4]
-            return build_frame(
-                bytes([0xA5, 0x5B, 0x02, 0x01, output, 0, self.routes[output]])
+        command, value = frame[2:4], frame[4]
+        if command == b"\x08\x0b":
+            self.power = value == 0x0F
+            return _frame(0x08, 0x0B, 0x00)
+        if not self.power:
+            return _frame(0x08, 0x0C, 0xF0)
+        if command == b"\x08\x0c":
+            return _frame(0x08, 0x0C, 0x0F)
+        if command == b"\x06\x01":
+            self.beep = value == 0x0F
+            return _frame(0x06, 0x01, 0x00)
+        if command == b"\x01\x0b":
+            return _frame(0x01, 0x0B, 0x00, 0x00, 0x00 if self.beep else 0xFF)
+        if command == b"\x01\x04":
+            return _frame(
+                0x01, 0x04, value, 0x00 if value in self.connected_inputs else 0xFF
             )
-        if frame[2:4] == b"\x02\x03":
-            if self.order == SWITCH_INPUT_FIRST:
-                input_, output = frame[4], frame[6]
-            else:
-                output, input_ = frame[4], frame[6]
-            self.routes[output] = input_
+        if command == b"\x01\x05":
+            return _frame(
+                0x01, 0x05, value, 0x00 if value in self.connected_outputs else 0xFF
+            )
+        if command == b"\x02\x01":
+            return _frame(0x02, 0x01, value, 0, self.routes[value])
+        if command == b"\x02\x03":
+            self.routes[frame[6]] = frame[4]
         return frame
 
 
@@ -462,8 +488,8 @@ class FakeHexMatrix:
 async def hex_matrix(device, fast_terminal, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(WebHexTransport, "idle_timeout", 0.05)
 
-    async def _start(order: str) -> tuple[FakeHexMatrix, BlackbirdMatrix]:
-        matrix = FakeHexMatrix({1: 1, 2: 2, 3: 3, 4: 4}, order)
+    async def _start() -> tuple[FakeHexMatrix, BlackbirdMatrix]:
+        matrix = FakeHexMatrix({1: 1, 2: 2, 3: 3, 4: 4})
         fake = await device(matrix.reply)
         return matrix, BlackbirdMatrix("127.0.0.1", fake.port, protocol="web_hex")
 
@@ -471,40 +497,63 @@ async def hex_matrix(device, fast_terminal, monkeypatch: pytest.MonkeyPatch):
 
 
 async def test_web_hex_state(hex_matrix) -> None:
-    matrix, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    matrix, client = await hex_matrix()
     matrix.routes.update({1: 2, 3: 4})
-    assert (await client.async_get_state()).outputs == {1: 2, 2: 2, 3: 4, 4: 4}
-    assert [f[4] for f in matrix.frames] == [1, 2, 3, 4]
+    state = await client.async_get_state()
+    assert state.outputs == {1: 2, 2: 2, 3: 4, 4: 4}
+    assert state.power is True
+    # Power first, then one query per output.
+    assert [f[2:5] for f in matrix.frames] == [
+        bytes([0x08, 0x0C, 0x00]),
+        *(bytes([0x02, 0x01, n]) for n in range(1, 5)),
+    ]
 
 
-@pytest.mark.parametrize("order", [SWITCH_INPUT_FIRST, SWITCH_OUTPUT_FIRST])
-async def test_web_hex_switch_learns_order(hex_matrix, order: str) -> None:
-    matrix, client = await hex_matrix(order)
+async def test_web_hex_switch(hex_matrix) -> None:
+    matrix, client = await hex_matrix()
     await client.async_set_output(1, 3)
-    # Only output 1 changed, whichever byte order the matrix uses.
     assert matrix.routes == {1: 3, 2: 2, 3: 3, 4: 4}
-    assert client._transport.switch_order == order
+    assert matrix.frames == [switch_frame(1, 3)]
 
-    sent = len(matrix.frames)
-    await client.async_set_output(2, 4)
-    assert matrix.routes == {1: 3, 2: 4, 3: 3, 4: 4}
-    assert len(matrix.frames) == sent + 1  # order known: just the switch
+
+async def test_web_hex_power(hex_matrix) -> None:
+    matrix, client = await hex_matrix()
+    await client.async_set_power(False)
+    assert matrix.power is False
+    state = await client.async_get_state()
+    assert state.power is False
+    assert state.outputs == {}
+    # Off: no routing queries are sent.
+    assert matrix.frames[-1] == GET_POWER_FRAME
+
+    await client.async_set_power(True)
+    assert (await client.async_get_state()).power is True
+
+
+async def test_web_hex_beep(hex_matrix) -> None:
+    matrix, client = await hex_matrix()
+    assert (await client.async_get_connections([("beep", 0)])).beep is True
+    await client.async_set_beep(False)
+    assert matrix.beep is False
+    assert (await client.async_get_connections([("beep", 0)])).beep is False
 
 
 async def test_web_hex_raw_command(hex_matrix) -> None:
-    matrix, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    matrix, client = await hex_matrix()
     matrix.routes[2] = 3
     reply = await client.async_send_raw("a5 5b 02 01 02")
     assert reply == "hex(a5,5b,02,01,02,00,03,00,00,00,00,00,f8)"
 
 
 async def test_web_hex_connections(hex_matrix) -> None:
-    _, client = await hex_matrix(SWITCH_INPUT_FIRST)
+    _, client = await hex_matrix()
     assert client.supports_connections
     state = await client.async_get_connections()
     assert state.inputs == {1: True, 2: True, 3: True, 4: True}
     assert state.outputs == {1: False, 2: True, 3: True, 4: True}
     assert state.raw["output_1"] == "ff"
+    assert state.raw["input_1"] == "00"
+    assert state.frames["output_1"].startswith("hex(a5,5b,01,05,01,ff")
 
 
 def test_connection_byte_positions() -> None:

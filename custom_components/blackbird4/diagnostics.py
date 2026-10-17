@@ -21,13 +21,16 @@ async def async_get_config_entry_diagnostics(
         "entry": {"data": dict(entry.data), "options": dict(entry.options)},
         "protocol": coordinator.client.protocol,
         "last_update_success": coordinator.last_update_success,
+        "power": data.power if data else None,
         "routes": data.outputs if data else None,
         "raw_status": data.raw if data else None,
         "connections": (
             {
                 "inputs": connections.inputs,
                 "outputs": connections.outputs,
+                "beep": connections.beep,
                 "status_bytes": connections.raw,
+                "status_frames": connections.frames,
             }
             if connections
             else None

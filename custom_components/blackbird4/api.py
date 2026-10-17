@@ -102,6 +102,8 @@ class MatrixState:
 
     outputs: dict[int, int] = field(default_factory=dict)
     raw: Any = None
+    #: None when the protocol can't report power.
+    power: bool | None = None
 
     def input_for(self, output: int) -> int | None:
         """Return the input routed to ``output``, if known."""
@@ -409,11 +411,6 @@ FRAME_HEADER = b"\xa5\x5b"
 FRAME_LENGTH = 13
 _HEX_GROUP_RE = re.compile(r"hex\(([0-9a-fA-F,\s]*)\)")
 
-# Byte order of the switch frame's port bytes. Vendor sheets disagree on
-# whether byte 5 is the input or the output, so it is learned at runtime.
-SWITCH_INPUT_FIRST = "input_first"
-SWITCH_OUTPUT_FIRST = "output_first"
-
 
 def build_frame(body: bytes) -> bytes:
     """Pad a frame body to 12 bytes and append its checksum byte."""
@@ -431,12 +428,46 @@ def query_frame(output: int) -> bytes:
     return build_frame(bytes([0xA5, 0x5B, 0x02, 0x01, output]))
 
 
-def switch_frame(output: int, input_: int, order: str) -> bytes:
-    """Return the frame routing ``input_`` to ``output``."""
-    first, second = (
-        (input_, output) if order == SWITCH_INPUT_FIRST else (output, input_)
-    )
-    return build_frame(bytes([0xA5, 0x5B, 0x02, 0x03, first, 0x00, second]))
+def switch_frame(output: int, input_: int) -> bytes:
+    """Return the frame routing ``input_`` to ``output`` (input byte first,
+    as the matrix's own web UI builds it)."""
+    return build_frame(bytes([0xA5, 0x5B, 0x02, 0x03, input_, 0x00, output]))
+
+
+# Power and beep frames, as the PN 39668's web UI (js/processor.js) sends them.
+POWER_ON_FRAME = build_frame(bytes([0xA5, 0x5B, 0x08, 0x0B, 0x0F]))
+POWER_OFF_FRAME = build_frame(bytes([0xA5, 0x5B, 0x08, 0x0B, 0xF0]))
+GET_POWER_FRAME = build_frame(bytes([0xA5, 0x5B, 0x08, 0x0C]))
+BEEP_ON_FRAME = build_frame(bytes([0xA5, 0x5B, 0x06, 0x01, 0x0F]))
+BEEP_OFF_FRAME = build_frame(bytes([0xA5, 0x5B, 0x06, 0x01, 0xF0]))
+GET_BEEP_FRAME = build_frame(bytes([0xA5, 0x5B, 0x01, 0x0B]))
+
+
+def power_state(frames: list[bytes]) -> bool | None:
+    """Return the power state from the newest ``08 0C`` reply (0F on, F0 off).
+
+    A powered-off matrix answers every command with this reply.
+    """
+    for frame in reversed(frames):
+        if frame[2:4] == b"\x08\x0c" and frame[4] in (0x0F, 0xF0):
+            return frame[4] == 0x0F
+    return None
+
+
+def beep_state(frames: list[bytes]) -> bool | None:
+    """Return the beep state from the newest ``01 0B`` reply (00 means on)."""
+    for frame in reversed(frames):
+        if frame[2:4] == b"\x01\x0b":
+            return frame[6] == 0x00
+    return None
+
+
+def command_accepted(frames: list[bytes], command: bytes) -> bool | None:
+    """Return whether the newest reply to a set command reports success (00)."""
+    for frame in reversed(frames):
+        if frame[2:4] == command:
+            return frame[4] == 0x00
+    return None
 
 
 def parse_frames(text: str) -> list[bytes]:
@@ -468,6 +499,8 @@ def routed_input(frames: list[bytes], output: int) -> int | None:
 
 CONNECTION_INPUT = "input"
 CONNECTION_OUTPUT = "output"
+# Polled alongside connection status: changes rarely, costs a round trip.
+STATUS_BEEP = ("beep", 0)
 # A5 5B 01 04 <port> asks whether an input has a source plugged in;
 # A5 5B 01 05 <port> asks whether an output has a display (HPD).
 _CONNECTION_COMMANDS = {CONNECTION_INPUT: 0x04, CONNECTION_OUTPUT: 0x05}
@@ -479,7 +512,9 @@ class ConnectionState:
 
     inputs: dict[int, bool] = field(default_factory=dict)
     outputs: dict[int, bool] = field(default_factory=dict)
+    beep: bool | None = None
     raw: dict[str, str | None] = field(default_factory=dict)
+    frames: dict[str, str] = field(default_factory=dict)
 
 
 def connection_frame(kind: str, port: int) -> bytes:
@@ -500,10 +535,12 @@ def connection_byte(frames: list[bytes], kind: str, port: int) -> int | None:
 
 
 def connection_from_byte(kind: str, value: int) -> bool:
-    """Interpret a status byte: inputs report FF when a source is plugged
-    in; outputs report FF when hot-plug detect is low (no display)."""
-    if kind == CONNECTION_INPUT:
-        return value == 0xFF
+    """Interpret a status byte: 00 means connected, FF means nothing there.
+
+    Checked on a PN 39668 against its web UI (inputs all connected read 00;
+    the output without a display reads FF). Some vendor sheets say inputs
+    use the opposite polarity; this firmware doesn't.
+    """
     return value != 0xFF
 
 
@@ -580,11 +617,6 @@ class WebHexTransport(WebTerminalTransport):
     protocol = PROTOCOL_WEB_HEX
     num_outputs = 4
 
-    def __init__(self, host: str, port: int, timeout: float) -> None:
-        """Initialise the transport."""
-        super().__init__(host, port, timeout)
-        self.switch_order: str | None = None
-
     async def exchange_frame(
         self,
         frame: bytes,
@@ -633,27 +665,54 @@ class WebHexTransport(WebTerminalTransport):
             ]
         state = ConnectionState()
         for kind, port in ports:
+            if (kind, port) == STATUS_BEEP:
+                reply = await self.exchange_frame(GET_BEEP_FRAME, match=beep_state)
+                state.beep = beep_state(parse_frames(reply))
+                continue
             matcher = partial(connection_byte, kind=kind, port=port)
             reply = await self.exchange_frame(
                 connection_frame(kind, port), match=matcher
             )
-            value = matcher(parse_frames(reply))
+            frames = parse_frames(reply)
+            value = matcher(frames)
             state.raw[f"{kind}_{port}"] = None if value is None else f"{value:02x}"
+            if frames:
+                state.frames[f"{kind}_{port}"] = frame_to_hex(frames[-1])
             if value is not None:
                 results = state.inputs if kind == CONNECTION_INPUT else state.outputs
                 results[port] = connection_from_byte(kind, value)
         return state
 
-    async def query_output(self, output: int) -> int | None:
-        """Return the input routed to ``output``, or None if it didn't say."""
-        return routed_input(
-            parse_frames(await self.exchange_frame(query_frame(output), output)),
-            output,
+    async def get_power(self) -> bool | None:
+        """Return whether the matrix is on, or None if it didn't say."""
+        reply = await self.exchange_frame(GET_POWER_FRAME, match=power_state)
+        return power_state(parse_frames(reply))
+
+    async def set_power(self, on: bool) -> None:
+        """Turn the matrix on or off."""
+        await self._set(POWER_ON_FRAME if on else POWER_OFF_FRAME, b"\x08\x0b")
+
+    async def set_beep(self, on: bool) -> None:
+        """Turn the front-panel beep on or off."""
+        await self._set(BEEP_ON_FRAME if on else BEEP_OFF_FRAME, b"\x06\x01")
+
+    async def _set(self, frame: bytes, command: bytes) -> None:
+        matcher = partial(command_accepted, command=command)
+        accepted = matcher(
+            parse_frames(await self.exchange_frame(frame, match=matcher))
         )
+        # No reply is tolerated (the next poll shows the result); a reply
+        # that reports failure is not.
+        if accepted is False:
+            raise BlackbirdProtocolError(f"Matrix rejected {frame_to_hex(frame)}")
 
     async def get_state(self) -> MatrixState:
-        """Return the current routing, one query per output."""
-        state = MatrixState(raw=[])
+        """Return power and, while on, the routing (one query per output)."""
+        power = await self.get_power()
+        if power is False:
+            # Off: the matrix answers every query with "power off".
+            return MatrixState(raw=[], power=False)
+        state = MatrixState(raw=[], power=power)
         for output in range(1, self.num_outputs + 1):
             reply = await self.exchange_frame(query_frame(output), output)
             state.raw.append(reply)
@@ -676,34 +735,9 @@ class WebHexTransport(WebTerminalTransport):
             )
         return await self.exchange_frame(data)
 
-    async def _verify(self, output: int) -> int | None:
-        # Read another output first so a stale reply for this one can't match.
-        await self.query_output(output % self.num_outputs + 1)
-        return await self.query_output(output)
-
     async def set_output(self, output: int, input_: int) -> None:
-        """Route ``input_`` to ``output``, learning the frame's byte order once."""
-        if self.switch_order is not None:
-            await self.exchange_frame(switch_frame(output, input_, self.switch_order))
-            return
-        before = (await self.get_state()).outputs
-        await self.exchange_frame(switch_frame(output, input_, SWITCH_INPUT_FIRST))
-        if await self._verify(output) == input_:
-            self.switch_order = SWITCH_INPUT_FIRST
-            return
-        # The frame meant "output first", so it routed input `output` to
-        # output `input_`. Put that output back, then make the real switch.
-        self.switch_order = SWITCH_OUTPUT_FIRST
-        if (previous := before.get(input_)) is not None:
-            await self.exchange_frame(
-                switch_frame(input_, previous, SWITCH_OUTPUT_FIRST)
-            )
-        await self.exchange_frame(switch_frame(output, input_, SWITCH_OUTPUT_FIRST))
-        if await self._verify(output) != input_:
-            self.switch_order = None
-            raise BlackbirdProtocolError(
-                f"Output {output} did not switch to input {input_}"
-            )
+        """Route ``input_`` to ``output``."""
+        await self.exchange_frame(switch_frame(output, input_))
 
 
 class TcpTransport:
@@ -819,6 +853,25 @@ class BlackbirdMatrix:
         """Return the current routing."""
         async with self._lock:
             return await self._transport.get_state()
+
+    @property
+    def supports_power(self) -> bool:
+        """Whether the matrix can be switched on and off (and its beep set)."""
+        return isinstance(self._transport, WebHexTransport)
+
+    async def async_set_power(self, on: bool) -> None:
+        """Turn the matrix on or off."""
+        if not isinstance(self._transport, WebHexTransport):
+            raise BlackbirdProtocolError("Power control isn't supported")
+        async with self._lock:
+            await self._transport.set_power(on)
+
+    async def async_set_beep(self, on: bool) -> None:
+        """Turn the front-panel beep on or off."""
+        if not isinstance(self._transport, WebHexTransport):
+            raise BlackbirdProtocolError("Beep control isn't supported")
+        async with self._lock:
+            await self._transport.set_beep(on)
 
     async def async_get_connections(
         self, ports: Iterable[tuple[str, int]] | None = None

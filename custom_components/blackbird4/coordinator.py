@@ -84,8 +84,27 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
                 return number
         raise HomeAssistantError(f"Unknown input: {name}")
 
+    def _ensure_powered(self) -> None:
+        if self.data is not None and self.data.power is False:
+            raise HomeAssistantError("The matrix is powered off")
+
+    async def async_set_power(self, on: bool) -> None:
+        """Turn the matrix on or off."""
+        try:
+            await self.client.async_set_power(on)
+        except BlackbirdError as err:
+            raise HomeAssistantError(
+                f"Failed to turn the matrix {'on' if on else 'off'}: {err}"
+            ) from err
+        if self.data is not None:
+            # Routes are unknown while off; the next poll fills them back in.
+            self.async_set_updated_data(
+                replace(self.data, power=on, outputs=self.data.outputs if on else {})
+            )
+
     async def async_set_output(self, output: int, input_: int) -> None:
         """Route an input to an output."""
+        self._ensure_powered()
         try:
             await self.client.async_set_output(output, input_)
         except BlackbirdError as err:
@@ -96,6 +115,7 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
 
     async def async_set_all(self, input_: int) -> None:
         """Route an input to every output."""
+        self._ensure_powered()
         try:
             await self.client.async_set_all(input_, OUTPUTS)
         except BlackbirdError as err:
@@ -113,7 +133,7 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
 
 
 class ConnectionCoordinator(DataUpdateCoordinator[ConnectionState]):
-    """Poll which ports have something plugged in.
+    """Poll which ports have something plugged in, and the beep setting.
 
     Kept separate and slow: each port costs a round trip, and cables change
     far less often than routes. Only ports whose sensors are enabled are
@@ -153,6 +173,15 @@ class ConnectionCoordinator(DataUpdateCoordinator[ConnectionState]):
             self._wanted.discard((kind, port))
 
         return _unwant
+
+    async def async_set_beep(self, on: bool) -> None:
+        """Turn the front-panel beep on or off."""
+        try:
+            await self.client.async_set_beep(on)
+        except BlackbirdError as err:
+            raise HomeAssistantError(f"Failed to set the beep: {err}") from err
+        if self.data is not None:
+            self.async_set_updated_data(replace(self.data, beep=on))
 
     async def _async_update_data(self) -> ConnectionState:
         if not self._wanted:
