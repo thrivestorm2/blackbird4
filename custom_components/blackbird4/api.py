@@ -17,7 +17,13 @@ over a raw socket to work around that.
 ``json``: the web UI posts JSON commands such as
 ``{"comhead": "get video status", "language": 0}`` to ``/cgi-bin/instr``.
 
-``tcp``: the RS-232 command set on a raw TCP port.
+``web_terminal``: the web UI is a terminal for the RS-232 command set.
+Commands go out as ``GET /cgi-bin/instr?cmd=<command>\\r`` and replies are
+read back from ``GET /cgi-bin/query``. This firmware (seen on PN 39668, web
+UI titled "B44H70") uses the "bang" command set: ``s in 1 av out 2!``.
+
+``tcp`` / ``tcp_bang``: the RS-232 command set on a raw TCP port, in the
+classic ``OUT01:02.`` form or the bang form.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
+from urllib.parse import quote
 
 STATUS_PATH = "/cgi-bin/MUH44TP_getsetparams.cgi"
 COMMAND_PATH = "/cgi-bin/MMX32_Keyvalue.cgi"
@@ -38,14 +45,29 @@ STATUS_BODY = "lcc"
 JSON_PATH = "/cgi-bin/instr"
 JSON_STATUS = {"comhead": "get video status", "language": 0}
 
+WEB_TERMINAL_SEND_PATH = "/cgi-bin/instr"
+WEB_TERMINAL_QUERY_PATH = "/cgi-bin/query"
+
 PROTOCOL_HTTP = "http"
 PROTOCOL_JSON = "json"
+PROTOCOL_WEB_TERMINAL = "web_terminal"
 PROTOCOL_TCP = "tcp"
+PROTOCOL_TCP_BANG = "tcp_bang"
+
+DIALECT_DOT = "dot"
+DIALECT_BANG = "bang"
+BANG_STATUS = "r av out 0!"
 
 _TCP_STATUS_RE = re.compile(
     r"out(?:put)?\s*0*(\d+)(?:\s*:\s*|\D{0,20}?in(?:put)?\s*)0*(\d+)",
     re.IGNORECASE,
 )
+# Bang status lines put the input first: "input 1 -> output 2".
+_BANG_STATUS_RE = re.compile(
+    r"\bin(?:put)?\s*0*(\d+)[ \t]*(?:->|=>|>|av|to|-)?[ \t]*out(?:put)?\s*0*(\d+)",
+    re.IGNORECASE,
+)
+_REJECTED_RE = re.compile(r"err|invalid|unknown|fail", re.IGNORECASE)
 
 
 class BlackbirdError(Exception):
@@ -81,6 +103,27 @@ def build_command(command: str) -> str:
 def route_command(output: int, input_: int) -> str:
     """Return the RS-232 command routing ``input_`` to ``output`` (0 = all)."""
     return f"OUT{output:02d}:{input_:02d}."
+
+
+def build_bang_command(command: str) -> str:
+    """Normalise a bang command so it ends with the required "!"."""
+    command = command.strip()
+    return command if command.endswith("!") else f"{command}!"
+
+
+def bang_route_commands(output: int, input_: int) -> list[str]:
+    """Return the bang commands routing ``input_`` to ``output``, preferred first.
+
+    Monoprice's manual abbreviates the command as ``s [x] av [y]!``; the OEM
+    form is ``s in x av out y!``. The short form is tried if the long one is
+    rejected.
+    """
+    return [f"s in {input_} av out {output}!", f"s {input_} av {output}!"]
+
+
+def jquery_encode(value: str) -> str:
+    """URL-encode a query value exactly like jQuery's ``$.param``."""
+    return quote(value, safe="-_.!~*'()").replace("%20", "+")
 
 
 def parse_http_response(response: bytes) -> str:
@@ -168,14 +211,20 @@ def state_from_status(data: dict[str, Any]) -> MatrixState:
     return state
 
 
-def state_from_text(text: str) -> MatrixState:
+def state_from_text(text: str, dialect: str = DIALECT_DOT) -> MatrixState:
     """Build a MatrixState from an RS-232 style status reply.
 
-    Matches lines such as ``Output 01 Switch To In 02!`` or ``OUT01:02``.
+    Dot dialect: lines such as ``Output 01 Switch To In 02!`` or ``OUT01:02``.
+    Bang dialect: lines such as ``input 2 -> output 1``. Later lines win, so
+    a reply buffer holding older output still yields the current route.
     """
     state = MatrixState(raw=text)
-    for output, input_ in _TCP_STATUS_RE.findall(text):
-        state.outputs[int(output)] = int(input_)
+    if dialect == DIALECT_BANG:
+        for input_, output in _BANG_STATUS_RE.findall(text):
+            state.outputs[int(output)] = int(input_)
+    else:
+        for output, input_ in _TCP_STATUS_RE.findall(text):
+            state.outputs[int(output)] = int(input_)
     if not state.outputs:
         raise BlackbirdProtocolError(f"No routing found in reply: {text[:200]!r}")
     return state
@@ -311,16 +360,75 @@ class JsonTransport(HttpTransport):
             raise BlackbirdProtocolError(f"Matrix rejected the switch: {reply}")
 
 
+async def _bang_set_output(transport: Any, output: int, input_: int) -> None:
+    """Route with the bang command set, falling back to the short form."""
+    for command in bang_route_commands(output, input_):
+        reply = await transport.send(command)
+        if not _REJECTED_RE.search(reply):
+            return
+    raise BlackbirdProtocolError(f"Matrix rejected the switch: {reply.strip()!r}")
+
+
+class WebTerminalTransport(HttpTransport):
+    """Send RS-232 commands through the web UI's terminal endpoints."""
+
+    protocol = PROTOCOL_WEB_TERMINAL
+    #: Seconds between polls of the reply buffer, and how many polls to make.
+    reply_delay = 0.3
+    reply_polls = 5
+
+    async def _query(self) -> str:
+        return parse_http_response(await self.request("GET", WEB_TERMINAL_QUERY_PATH))
+
+    async def exchange(self, command: str) -> str:
+        """Send a command and return the matrix's reply text."""
+        # Drain any stale reply so it isn't mistaken for this one.
+        await self._query()
+        parse_http_response(
+            await self.request(
+                "GET",
+                f"{WEB_TERMINAL_SEND_PATH}?cmd={jquery_encode(command + chr(13))}",
+            )
+        )
+        reply = ""
+        for _ in range(self.reply_polls):
+            await asyncio.sleep(self.reply_delay)
+            reply += await self._query()
+            if reply.strip():
+                # Multi-line replies can arrive in pieces; collect the rest.
+                await asyncio.sleep(self.reply_delay)
+                reply += await self._query()
+                break
+        return reply
+
+    async def get_state(self) -> MatrixState:
+        """Return the current routing."""
+        return state_from_text(await self.exchange(BANG_STATUS), DIALECT_BANG)
+
+    async def send(self, command: str) -> str:
+        """Send a bang command (a trailing "!" is added if missing)."""
+        return await self.exchange(build_bang_command(command))
+
+    async def set_output(self, output: int, input_: int) -> None:
+        """Route ``input_`` to ``output``."""
+        await _bang_set_output(self, output, input_)
+
+
 class TcpTransport:
     """Talk to the matrix's RS-232 command set over a raw TCP socket."""
 
     protocol = PROTOCOL_TCP
 
-    def __init__(self, host: str, port: int, timeout: float) -> None:
+    def __init__(
+        self, host: str, port: int, timeout: float, dialect: str = DIALECT_DOT
+    ) -> None:
         """Initialise the transport."""
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.dialect = dialect
+        if dialect == DIALECT_BANG:
+            self.protocol = PROTOCOL_TCP_BANG
 
     async def _exchange(self, command: str) -> str:
         try:
@@ -332,7 +440,7 @@ class TcpTransport:
             ) from err
         chunks: list[bytes] = []
         try:
-            writer.write(build_command(command).encode() + b"\r\n")
+            writer.write(command.encode() + b"\r\n")
             await writer.drain()
             # The matrix doesn't frame its replies; read until it goes quiet.
             while True:
@@ -353,15 +461,22 @@ class TcpTransport:
 
     async def get_state(self) -> MatrixState:
         """Return the current routing."""
+        if self.dialect == DIALECT_BANG:
+            return state_from_text(await self._exchange(BANG_STATUS), DIALECT_BANG)
         return state_from_text(await self._exchange("Status."))
 
     async def send(self, command: str) -> str:
-        """Send an RS-232 command."""
-        return await self._exchange(command)
+        """Send an RS-232 command, adding the dialect's terminator if missing."""
+        if self.dialect == DIALECT_BANG:
+            return await self._exchange(build_bang_command(command))
+        return await self._exchange(build_command(command))
 
     async def set_output(self, output: int, input_: int) -> None:
         """Route ``input_`` to ``output``."""
-        await self.send(route_command(output, input_))
+        if self.dialect == DIALECT_BANG:
+            await _bang_set_output(self, output, input_)
+        else:
+            await self.send(route_command(output, input_))
 
 
 class BlackbirdMatrix:
@@ -375,13 +490,16 @@ class BlackbirdMatrix:
         timeout: float = 5.0,
     ) -> None:
         """Initialise the client."""
-        transport_cls = {
-            PROTOCOL_TCP: TcpTransport,
-            PROTOCOL_JSON: JsonTransport,
-        }.get(protocol, HttpTransport)
-        self._transport: HttpTransport | TcpTransport = transport_cls(
-            host, port, timeout
-        )
+        self._transport: HttpTransport | TcpTransport
+        if protocol == PROTOCOL_TCP_BANG:
+            self._transport = TcpTransport(host, port, timeout, DIALECT_BANG)
+        else:
+            transport_cls = {
+                PROTOCOL_TCP: TcpTransport,
+                PROTOCOL_JSON: JsonTransport,
+                PROTOCOL_WEB_TERMINAL: WebTerminalTransport,
+            }.get(protocol, HttpTransport)
+            self._transport = transport_cls(host, port, timeout)
         self._lock = asyncio.Lock()
 
     @property
@@ -515,6 +633,14 @@ async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:
     lines += [f"  {snip}" for snip in snippets[:_MAX_SNIPPETS]] or ["  none found"]
     if len(snippets) > _MAX_SNIPPETS:
         lines.append(f"  ... {len(snippets) - _MAX_SNIPPETS} more")
+    terminal = WebTerminalTransport(host, port, timeout)
+    try:
+        reply = await terminal.exchange(BANG_STATUS)
+        lines.append(
+            f"Web terminal {BANG_STATUS!r}: {_snippet(reply, 400) or '(no reply)'}"
+        )
+    except BlackbirdError as err:
+        lines.append(f"Web terminal {BANG_STATUS!r}: {err}")
     await _probe_post(
         http, JSON_PATH, json.dumps(JSON_STATUS), "application/json", lines
     )

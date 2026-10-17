@@ -68,7 +68,7 @@
     },
     "send_command": {
       "name": "Send command",
-      "description": "Send a raw command to the matrix and return its reply: RS-232 text such as OUT01:02. on most firmware, or a JSON command such as {\"comhead\": \"get video status\", \"language\": 0} on firmware whose web UI uses /cgi-bin/instr.",
+      "description": "Send a raw command in the matrix's own command set and return its reply, for example r av out 0! (PN 39668), OUT01:02. (older Blackbird firmware), or a JSON command on /cgi-bin/instr JSON firmware.",
       "fields": {
         "config_entry_id": {
           "name": "Matrix",
@@ -76,7 +76,7 @@
         },
         "command": {
           "name": "Command",
-          "description": "The command. For RS-232 text a trailing period is added if missing."
+          "description": "The command. The terminator (! or .) is added if missing."
         }
       }
     }

@@ -15,7 +15,7 @@ It talks to the same CGI endpoints the matrix's own web page uses, so you don't 
 - Custom names for inputs and outputs, e.g. "Apple TV" → "Living Room TV".
 - Services:
   - `blackbird4.set_all_outputs`: route one input to every output.
-  - `blackbird4.send_command`: send any raw RS-232 command (`PowerOFF.`, `EDID…`) and get the reply back.
+  - `blackbird4.send_command`: send any raw command in your matrix's command set (`r av out 0!`, `PowerOFF.`, …) and get the reply back.
 - Local polling (every 10 s by default). Entities go unavailable if the matrix stops answering.
 - Diagnostics download that includes the raw status reply, useful for bug reports.
 - Bundled integration icon, shown on Home Assistant 2026.3 and later.
@@ -92,8 +92,10 @@ Blackbird matrices are rebadged OEM hardware, and the protocol depends on the fi
 | Protocol | Read routing | Switch |
 | --- | --- | --- |
 | `http` | `POST /cgi-bin/MUH44TP_getsetparams.cgi`, body `lcc`. The reply is `({'Outputbuttom': ['1','2','3','4'], ...})`, where entry *n* is the input routed to output *n*. | `POST /cgi-bin/MMX32_Keyvalue.cgi`, body `{CMD=OUT03:02.` |
+| `web_terminal` (PN 39668, web UI "B44H70") | `GET /cgi-bin/instr?cmd=r+av+out+0!%0D`, then `GET /cgi-bin/query` for the reply, e.g. `input 2 -> output 1` | `s in 2 av out 1!` (falls back to `s 2 av 1!`) |
 | `json` | `POST /cgi-bin/instr`, body `{"comhead":"get video status","language":0}`. The reply's `allsource` list gives the input for each output. | `{"comhead":"video switch","language":0,"source":[3,2]}` |
 | `tcp` | `Status.` on TCP port 23/4001/8000/5000 | `OUT03:02.` |
+| `tcp_bang` | `r av out 0!` on TCP port 8000/23/4001/5000 | `s in 2 av out 1!` |
 
 If none of them answer, the setup form shows a probe report quoting the request code from the matrix's own web UI scripts.
 

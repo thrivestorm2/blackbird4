@@ -21,6 +21,6 @@ send_command:
           integration: blackbird4
     command:
       required: true
-      example: "OUT01:02."
+      example: "r av out 0!"
       selector:
         text:
