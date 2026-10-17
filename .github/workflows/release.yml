@@ -1,9 +1,16 @@
 name: Release
 
+# Publishes a GitHub release (and its tag) for the manifest version when
+# that version reaches main and hasn't been released yet. HACS offers
+# releases as updates.
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - custom_components/blackbird4/manifest.json
+      - .github/workflows/release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,14 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check the tag matches the manifest version
-        run: |
-          manifest_version=$(python3 -c "import json; print(json.load(open('custom_components/blackbird4/manifest.json'))['version'])")
-          if [ "v${manifest_version}" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match manifest version ${manifest_version}"
-            exit 1
-          fi
-      - name: Publish the GitHub release
+      - name: Publish the release if this version is new
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('custom_components/blackbird4/manifest.json'))['version'])")
+          tag="v${version}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "${tag} is already released"
+            exit 0
+          fi
+          gh release create "${tag}" --target "${GITHUB_SHA}" --title "${tag}" --generate-notes
