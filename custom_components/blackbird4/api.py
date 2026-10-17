@@ -78,6 +78,10 @@ class BlackbirdConnectionError(BlackbirdError):
     """The matrix could not be reached."""
 
 
+class BlackbirdTimeoutError(BlackbirdConnectionError):
+    """The matrix accepted the connection but sent no response in time."""
+
+
 class BlackbirdProtocolError(BlackbirdError):
     """The matrix replied with something we could not understand."""
 
@@ -163,6 +167,10 @@ def _dechunk(body: str) -> str:
         out.append(rest[:size].decode("utf-8", errors="replace"))
         data = rest[size + 2 :]
     return "".join(out)
+
+
+def _headers_received(data: bytes) -> bool:
+    return b"\r\n\r\n" in data or b"\n\n" in data
 
 
 def _response_complete(data: bytes) -> bool:
@@ -252,6 +260,8 @@ class HttpTransport:
     """Talk to the matrix through its web UI's CGI endpoints."""
 
     protocol = PROTOCOL_HTTP
+    #: Seconds of silence after the headers that end an unframed response.
+    idle_timeout = 0.5
 
     def __init__(self, host: str, port: int, timeout: float) -> None:
         """Initialise the transport."""
@@ -268,39 +278,64 @@ class HttpTransport:
         path: str,
         body: str = "",
         content_type: str = "application/x-www-form-urlencoded",
+        timeout: float | None = None,
     ) -> bytes:
         """Send a request and return the raw response, headers included."""
-        request = (
-            f"{method} {path} HTTP/1.1\r\n"
-            f"Host: {self.host}\r\n"
-            "Accept: */*\r\n"
-            f"Content-Type: {content_type}\r\n"
-            f"Content-Length: {len(body.encode())}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            f"{body}"
-        ).encode()
+        timeout = timeout or self.timeout
+        lines = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {self.host}",
+            "Accept: */*",
+            "X-Requested-With: XMLHttpRequest",
+            "Connection: close",
+        ]
+        if method != "GET":
+            lines += [
+                f"Content-Type: {content_type}",
+                f"Content-Length: {len(body.encode())}",
+            ]
+        request = ("\r\n".join(lines) + "\r\n\r\n" + body).encode()
+        loop = asyncio.get_running_loop()
         try:
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(timeout):
                 reader, writer = await asyncio.open_connection(self.host, self.port)
-                try:
-                    writer.write(request)
-                    await writer.drain()
-                    response = b""
-                    # Some servers ignore "Connection: close", so stop once
-                    # the response is complete instead of waiting for EOF.
-                    while chunk := await reader.read(4096):
-                        response += chunk
-                        if _response_complete(response):
-                            break
-                finally:
-                    writer.close()
-                    with contextlib.suppress(OSError):
-                        await writer.wait_closed()
         except (OSError, TimeoutError) as err:
             raise BlackbirdConnectionError(
-                f"Cannot reach {self.host}:{self.port}: {err}"
+                f"Cannot reach {self.host}:{self.port}: {err!r}"
             ) from err
+        deadline = loop.time() + timeout
+        response = b""
+        try:
+            writer.write(request)
+            await writer.drain()
+            while True:
+                wait = deadline - loop.time()
+                if _headers_received(response):
+                    # Some servers neither close the connection nor say how
+                    # long the body is, so a pause after the headers ends it.
+                    wait = min(wait, self.idle_timeout)
+                try:
+                    chunk = await asyncio.wait_for(reader.read(4096), max(wait, 0))
+                except TimeoutError as err:
+                    if _headers_received(response):
+                        break
+                    raise BlackbirdTimeoutError(
+                        f"No response from {self.host}:{self.port} to {method} "
+                        f"{path.split('?')[0]} within {timeout:g}s"
+                    ) from err
+                if not chunk:
+                    break
+                response += chunk
+                if _response_complete(response):
+                    break
+        except OSError as err:
+            raise BlackbirdConnectionError(
+                f"Connection to {self.host}:{self.port} failed: {err!r}"
+            ) from err
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
         return response
 
     async def get_state(self) -> MatrixState:
@@ -376,20 +411,33 @@ class WebTerminalTransport(HttpTransport):
     #: Seconds between polls of the reply buffer, and how many polls to make.
     reply_delay = 0.3
     reply_polls = 5
+    #: The reply buffer may be held open while empty, so don't wait long.
+    query_timeout = 1.5
 
     async def _query(self) -> str:
-        return parse_http_response(await self.request("GET", WEB_TERMINAL_QUERY_PATH))
+        """Read the reply buffer; "" if the matrix holds the request open."""
+        try:
+            return parse_http_response(
+                await self.request(
+                    "GET", WEB_TERMINAL_QUERY_PATH, timeout=self.query_timeout
+                )
+            )
+        except BlackbirdTimeoutError:
+            return ""
 
     async def exchange(self, command: str) -> str:
         """Send a command and return the matrix's reply text."""
         # Drain any stale reply so it isn't mistaken for this one.
         await self._query()
-        parse_http_response(
-            await self.request(
-                "GET",
-                f"{WEB_TERMINAL_SEND_PATH}?cmd={jquery_encode(command + chr(13))}",
+        # Some firmware answers the send only after the matrix replies, or
+        # never; the command has been delivered either way.
+        with contextlib.suppress(BlackbirdTimeoutError):
+            parse_http_response(
+                await self.request(
+                    "GET",
+                    f"{WEB_TERMINAL_SEND_PATH}?cmd={jquery_encode(command + chr(13))}",
+                )
             )
-        )
         reply = ""
         for _ in range(self.reply_polls):
             await asyncio.sleep(self.reply_delay)
@@ -633,6 +681,16 @@ async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:
     lines += [f"  {snip}" for snip in snippets[:_MAX_SNIPPETS]] or ["  none found"]
     if len(snippets) > _MAX_SNIPPETS:
         lines.append(f"  ... {len(snippets) - _MAX_SNIPPETS} more")
+    for path in (
+        WEB_TERMINAL_QUERY_PATH,
+        f"{WEB_TERMINAL_SEND_PATH}?cmd=r+av+out+0!%0D",
+    ):
+        try:
+            raw = await http.request("GET", path, timeout=2)
+            head = raw.decode("utf-8", errors="replace").replace("\r", "")
+            lines.append(f"Raw GET {path}: {_snippet(head, 300) or '(empty)'}")
+        except BlackbirdError as err:
+            lines.append(f"Raw GET {path}: {type(err).__name__}: {err}")
     terminal = WebTerminalTransport(host, port, timeout)
     try:
         reply = await terminal.exchange(BANG_STATUS)
@@ -640,7 +698,7 @@ async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:
             f"Web terminal {BANG_STATUS!r}: {_snippet(reply, 400) or '(no reply)'}"
         )
     except BlackbirdError as err:
-        lines.append(f"Web terminal {BANG_STATUS!r}: {err}")
+        lines.append(f"Web terminal {BANG_STATUS!r}: {type(err).__name__}: {err}")
     await _probe_post(
         http, JSON_PATH, json.dumps(JSON_STATUS), "application/json", lines
     )
