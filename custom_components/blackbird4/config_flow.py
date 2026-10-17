@@ -17,6 +17,7 @@ import voluptuous as vol
 
 from .api import (
     PROTOCOL_HTTP,
+    PROTOCOL_JSON,
     PROTOCOL_TCP,
     BlackbirdConnectionError,
     BlackbirdError,
@@ -50,7 +51,7 @@ class UnknownProtocol(Exception):
 async def async_detect(host: str, port: int) -> dict[str, Any]:
     """Find a working protocol for the matrix and return entry data."""
     answered = False
-    candidates = [(PROTOCOL_HTTP, port)]
+    candidates = [(PROTOCOL_HTTP, port), (PROTOCOL_JSON, port)]
     tcp_ports = list(TCP_FALLBACK_PORTS)
     if port != DEFAULT_PORT:
         # A non-default port may be the raw TCP control port.
@@ -117,7 +118,7 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
         _LOGGER.warning("Blackbird probe of %s:%s:\n%s", host, port, report)
         self._details = (
             "\n\n**What the device replied** (copy this into a GitHub issue):"
-            f"\n```\n{report[:2500]}\n```"
+            f"\n```\n{report[:6000]}\n```"
         )
 
     async def async_step_user(

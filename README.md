@@ -86,12 +86,17 @@ logger:
 
 ## How it works
 
-| Action | Request |
-| --- | --- |
-| Read routing | `POST /cgi-bin/MUH44TP_getsetparams.cgi` with body `lcc`. The reply is `({'Outputbuttom': ['1','2','3','4'], ...})`, where entry *n* is the input routed to output *n*. |
-| Switch | `POST /cgi-bin/MMX32_Keyvalue.cgi` with body `{CMD=OUT03:02.`, which passes RS-232 commands through. |
+Blackbird matrices are rebadged OEM hardware, and the protocol depends on the firmware. Setup tries each of these and keeps the first one that answers:
 
-The matrix's web server sends malformed HTTP, so the integration uses a small raw-socket HTTP client and needs no third-party Python packages. Credit to [alexyao2015/hass-blackbird24180](https://github.com/alexyao2015/hass-blackbird24180) for documenting these endpoints on the 8x8 model.
+| Protocol | Read routing | Switch |
+| --- | --- | --- |
+| `http` | `POST /cgi-bin/MUH44TP_getsetparams.cgi`, body `lcc`. The reply is `({'Outputbuttom': ['1','2','3','4'], ...})`, where entry *n* is the input routed to output *n*. | `POST /cgi-bin/MMX32_Keyvalue.cgi`, body `{CMD=OUT03:02.` |
+| `json` | `POST /cgi-bin/instr`, body `{"comhead":"get video status","language":0}`. The reply's `allsource` list gives the input for each output. | `{"comhead":"video switch","language":0,"source":[3,2]}` |
+| `tcp` | `Status.` on TCP port 23/4001/8000/5000 | `OUT03:02.` |
+
+If none of them answer, the setup form shows a probe report quoting the request code from the matrix's own web UI scripts.
+
+The matrix's web server sends malformed HTTP, so the integration uses a small raw-socket HTTP client and needs no third-party Python packages. Credit to [alexyao2015/hass-blackbird24180](https://github.com/alexyao2015/hass-blackbird24180) and [ryan-haver/8x8-hdmi-matrix-hub](https://github.com/ryan-haver/8x8-hdmi-matrix-hub) for documenting the `http` and `json` protocols.
 
 ## Development
 

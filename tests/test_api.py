@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+import json
 
 import pytest
 
@@ -32,6 +33,7 @@ class FakeDevice:
         self.concurrent = 0
         self.max_concurrent = 0
         self.server: asyncio.Server | None = None
+        self.keep_open = False
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -44,6 +46,9 @@ class FakeDevice:
             await asyncio.sleep(0.01)
             writer.write(self.reply(data))
             await writer.drain()
+            if self.keep_open:
+                # Like a keep-alive server: wait for the client to hang up.
+                await reader.read()
         finally:
             self.concurrent -= 1
             writer.close()
@@ -167,11 +172,13 @@ async def test_tcp_transport(device) -> None:
     assert fake.received[1] == b"PowerOFF.\r\n"
 
 
-async def test_probe_reports_endpoints(device) -> None:
+async def test_probe_reports_request_code(device) -> None:
     pages = {
-        b"GET / ": b'<html><frameset><frame src="main.html"></frameset></html>',
-        b"GET /main.html ": b'<script src="js/app.js"></script>',
-        b"GET /js/app.js ": b'$.post("/cgi-bin/query.cgi", "{CMD=OUT"+o+":"+i+".");',
+        b"GET / ": b'<html><script src="js/jquery.min.js"></script>'
+        b'<script src="js/netRequest.js"></script></html>',
+        b"GET /js/jquery.min.js ": b"$.ajax=function(a){return a}; url: noise",
+        b"GET /js/netRequest.js ": b"function sw(o,i){$.ajax({url:'/cgi-bin/instr',"
+        b"data:JSON.stringify({comhead:'video switch',source:[o,i]})});}",
     }
 
     def reply(request: bytes) -> bytes:
@@ -182,8 +189,53 @@ async def test_probe_reports_endpoints(device) -> None:
 
     fake = await device(reply)
     report = await async_probe("127.0.0.1", fake.port)
-    assert "GET /main.html: HTTP/1.1 200 OK" in report
-    assert "GET /js/app.js: HTTP/1.1 200 OK" in report
-    assert "CGI endpoints: /cgi-bin/query.cgi" in report
-    assert "CMD=OUT" in report
-    assert "POST /cgi-bin/MUH44TP_getsetparams.cgi: HTTP/1.1 404 Not Found" in report
+    assert "GET /js/netRequest.js: HTTP/1.1 200 OK" in report
+    assert "[/js/netRequest.js]" in report
+    assert "comhead:'video switch'" in report
+    assert "[/js/jquery.min.js]" not in report
+    assert "POST /cgi-bin/instr" in report
+    assert (
+        "POST /cgi-bin/MUH44TP_getsetparams.cgi lcc: HTTP/1.1 404 Not Found" in report
+    )
+
+
+def _chunked(body: bytes) -> bytes:
+    # Keep-alive + chunked, like the JSON firmware; the server never closes.
+    return (
+        b"HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\nTransfer-Encoding: chunked\r\n"
+        b"content-type: text/plain\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+
+
+async def test_json_transport(device) -> None:
+    def reply(request: bytes) -> bytes:
+        payload = json.loads(request.split(b"\r\n\r\n", 1)[1])
+        if payload["comhead"] == "get video status":
+            return _chunked(
+                b'{"comhead":"get video status","power":1,"allsource":[2,1,4,3,1]}'
+            )
+        return _chunked(b'{"comhead":"video switch","result":1}')
+
+    fake = await device(reply)
+    fake.keep_open = True
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="json", timeout=2)
+    state = await client.async_get_state()
+    assert state.outputs == {1: 2, 2: 1, 3: 4, 4: 3, 5: 1}
+    assert b"Content-Type: application/json" in fake.received[0]
+
+    await client.async_set_output(2, 3)
+    assert json.loads(fake.received[1].split(b"\r\n\r\n", 1)[1]) == {
+        "comhead": "video switch",
+        "language": 0,
+        "source": [2, 3],
+    }
+
+
+async def test_json_switch_rejected(device) -> None:
+    fake = await device(lambda _: _chunked(b'{"comhead":"video switch","result":0}'))
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="json")
+    with pytest.raises(BlackbirdProtocolError):
+        await client.async_set_output(1, 9)

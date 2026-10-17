@@ -68,7 +68,7 @@
     },
     "send_command": {
       "name": "Send command",
-      "description": "Send a raw RS-232 command (for example OUT01:02. or PowerOFF.) to the matrix and return its reply.",
+      "description": "Send a raw command to the matrix and return its reply: RS-232 text such as OUT01:02. on most firmware, or a JSON command such as {\"comhead\": \"get video status\", \"language\": 0} on firmware whose web UI uses /cgi-bin/instr.",
       "fields": {
         "config_entry_id": {
           "name": "Matrix",
@@ -76,7 +76,7 @@
         },
         "command": {
           "name": "Command",
-          "description": "The command; a trailing period is added if missing."
+          "description": "The command. For RS-232 text a trailing period is added if missing."
         }
       }
     }
