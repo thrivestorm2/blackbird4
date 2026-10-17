@@ -29,7 +29,8 @@
     },
     "abort": {
       "already_configured": "This matrix is already configured.",
-      "reconfigure_successful": "The matrix address was updated."
+      "reconfigure_successful": "The matrix address was updated.",
+      "already_in_progress": "Setup for this matrix is already in progress. Close the other setup dialog, or restart Home Assistant, and try again."
     }
   },
   "options": {

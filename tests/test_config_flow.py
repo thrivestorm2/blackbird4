@@ -219,3 +219,26 @@ async def test_user_flow_detects_web_hex(hass: HomeAssistant, mock_client) -> No
         await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["protocol"] == "web_hex"
+
+
+async def test_retry_while_earlier_attempt_open(
+    hass: HomeAssistant, mock_client
+) -> None:
+    def failing(protocol, port):
+        return BlackbirdConnectionError("down")
+
+    # A first attempt that failed and was left open.
+    first = await _start(hass)
+    with patch(DETECT_CLIENT, _client_cls(failing)):
+        first = await hass.config_entries.flow.async_configure(
+            first["flow_id"], {"host": "192.168.1.39", "port": 80}
+        )
+    assert first["errors"] == {"base": "cannot_connect"}
+
+    second = await _start(hass)
+    with patch(DETECT_CLIENT, _client_cls(lambda protocol, port: MatrixState({1: 1}))):
+        second = await hass.config_entries.flow.async_configure(
+            second["flow_id"], {"host": "192.168.1.39", "port": 80}
+        )
+        await hass.async_block_till_done()
+    assert second["type"] is FlowResultType.CREATE_ENTRY
