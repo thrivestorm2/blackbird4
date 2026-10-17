@@ -19,6 +19,8 @@ from .api import (
     PROTOCOL_HTTP,
     PROTOCOL_JSON,
     PROTOCOL_TCP,
+    PROTOCOL_TCP_BANG,
+    PROTOCOL_WEB_TERMINAL,
     BlackbirdConnectionError,
     BlackbirdError,
     BlackbirdMatrix,
@@ -32,6 +34,7 @@ from .const import (
     DOMAIN,
     INPUTS,
     OUTPUTS,
+    TCP_BANG_PORTS,
     TCP_FALLBACK_PORTS,
     input_key,
     output_key,
@@ -51,12 +54,17 @@ class UnknownProtocol(Exception):
 async def async_detect(host: str, port: int) -> dict[str, Any]:
     """Find a working protocol for the matrix and return entry data."""
     answered = False
-    candidates = [(PROTOCOL_HTTP, port), (PROTOCOL_JSON, port)]
+    candidates = [
+        (PROTOCOL_HTTP, port),
+        (PROTOCOL_WEB_TERMINAL, port),
+        (PROTOCOL_JSON, port),
+    ]
     tcp_ports = list(TCP_FALLBACK_PORTS)
     if port != DEFAULT_PORT:
         # A non-default port may be the raw TCP control port.
         tcp_ports.insert(0, port)
     candidates += [(PROTOCOL_TCP, tcp_port) for tcp_port in dict.fromkeys(tcp_ports)]
+    candidates += [(PROTOCOL_TCP_BANG, tcp_port) for tcp_port in TCP_BANG_PORTS]
     for protocol, candidate_port in candidates:
         client = BlackbirdMatrix(host, candidate_port, protocol, timeout=3)
         try:

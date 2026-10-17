@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Callable
 import json
+import re
+from urllib.parse import unquote_plus
 
 import pytest
 
@@ -12,7 +14,9 @@ from custom_components.blackbird4.api import (
     BlackbirdConnectionError,
     BlackbirdMatrix,
     BlackbirdProtocolError,
+    WebTerminalTransport,
     async_probe,
+    jquery_encode,
     parse_http_response,
     parse_status_body,
     route_command,
@@ -239,3 +243,99 @@ async def test_json_switch_rejected(device) -> None:
     client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="json")
     with pytest.raises(BlackbirdProtocolError):
         await client.async_set_output(1, 9)
+
+
+def test_jquery_encode() -> None:
+    # Matches $.param: spaces as "+", "!" left alone, CR percent-encoded.
+    assert jquery_encode("r av out 0!\r") == "r+av+out+0!%0D"
+
+
+def test_state_from_text_bang() -> None:
+    text = "r av out 0!\r\ninput 2 -> output 1\r\ninput 1 -> output 2\r\ninput 3 -> output 2\r\n"
+    assert state_from_text(text, "bang").outputs == {1: 2, 2: 3}
+
+
+class FakeTerminal:
+    """Replies like the B44H70 web UI: /cgi-bin/instr in, /cgi-bin/query out."""
+
+    def __init__(self, routes: dict[int, int], accept_long_form: bool = True) -> None:
+        self.routes = routes
+        self.accept_long_form = accept_long_form
+        self.commands: list[str] = []
+        self.buffer = ""
+
+    def reply(self, request: bytes) -> bytes:
+        line = request.split(b"\r\n", 1)[0].decode()
+        if line.startswith("GET /cgi-bin/query "):
+            body, self.buffer = self.buffer, ""
+            return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (
+                len(body),
+                body.encode(),
+            )
+        if line.startswith("GET /cgi-bin/instr?cmd="):
+            command = unquote_plus(line.split("cmd=", 1)[1].split(" ")[0]).strip()
+            self.commands.append(command)
+            self.buffer = self._run(command)
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        return b"HTTP/1.1 404 Not Found\r\n\r\n"
+
+    def _run(self, command: str) -> str:
+        if command == "r av out 0!":
+            return "".join(
+                f"input {i} -> output {o}\r\n" for o, i in sorted(self.routes.items())
+            )
+        if match := re.fullmatch(r"s in (\d) av out (\d)!", command):
+            if not self.accept_long_form:
+                return "command error!\r\n"
+            self.routes[int(match.group(2))] = int(match.group(1))
+            return f"input {match.group(1)} -> output {match.group(2)}\r\n"
+        if match := re.fullmatch(r"s (\d) av (\d)!", command):
+            self.routes[int(match.group(2))] = int(match.group(1))
+            return f"input {match.group(1)} -> output {match.group(2)}\r\n"
+        return "command error!\r\n"
+
+
+@pytest.fixture
+def fast_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(WebTerminalTransport, "reply_delay", 0.01)
+
+
+@pytest.mark.usefixtures("fast_terminal")
+async def test_web_terminal(device) -> None:
+    terminal = FakeTerminal({1: 1, 2: 2, 3: 3, 4: 4})
+    fake = await device(terminal.reply)
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="web_terminal")
+    assert (await client.async_get_state()).outputs == {1: 1, 2: 2, 3: 3, 4: 4}
+
+    await client.async_set_output(3, 2)
+    assert terminal.commands[-1] == "s in 2 av out 3!"
+    assert (await client.async_get_state()).outputs[3] == 2
+
+    assert "input" in await client.async_send_raw("r av out 0")
+
+
+@pytest.mark.usefixtures("fast_terminal")
+async def test_web_terminal_falls_back_to_short_form(device) -> None:
+    terminal = FakeTerminal({1: 1, 2: 2, 3: 3, 4: 4}, accept_long_form=False)
+    fake = await device(terminal.reply)
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="web_terminal")
+    await client.async_set_output(4, 1)
+    assert terminal.commands[-2:] == ["s in 1 av out 4!", "s 1 av 4!"]
+    assert terminal.routes[4] == 1
+
+
+async def test_web_terminal_missing_endpoints(device) -> None:
+    fake = await device(lambda _: b"HTTP/1.1 404 Not Found\r\n\r\n")
+    with pytest.raises(BlackbirdProtocolError):
+        await BlackbirdMatrix(
+            "127.0.0.1", fake.port, protocol="web_terminal"
+        ).async_get_state()
+
+
+async def test_tcp_bang(device) -> None:
+    fake = await device(lambda _: b"input 3 -> output 1\r\ninput 4 -> output 2\r\n")
+    client = BlackbirdMatrix("127.0.0.1", fake.port, protocol="tcp_bang")
+    assert (await client.async_get_state()).outputs == {1: 3, 2: 4}
+    assert fake.received[0] == b"r av out 0!\r\n"
+    await client.async_set_output(1, 2)
+    assert fake.received[1] == b"s in 2 av out 1!\r\n"
