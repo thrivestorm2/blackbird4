@@ -18,6 +18,7 @@ It talks to the same CGI endpoints the matrix's own web page uses, so you don't 
   - `blackbird4.send_command`: send any raw RS-232 command (`PowerOFF.`, `EDID…`) and get the reply back.
 - Local polling (every 10 s by default). Entities go unavailable if the matrix stops answering.
 - Diagnostics download that includes the raw status reply, useful for bug reports.
+- Bundled integration icon, shown on Home Assistant 2026.3 and later.
 
 ## Installation
 

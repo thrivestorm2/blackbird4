@@ -16,7 +16,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Remove once a brand icon is submitted to home-assistant/brands.
+          # The icon ships in custom_components/blackbird4/brand/ (HA 2026.3+),
+          # not in home-assistant/brands, which this check looks at.
           ignore: brands
 
   hassfest:
