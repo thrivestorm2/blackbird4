@@ -73,9 +73,17 @@ class BlackbirdConnectionSensor(
         self._attr_unique_id = f"{entry.entry_id}_{kind}_{port}_connected"
         self._attr_device_info = device_info(coordinator)
 
+    async def async_added_to_hass(self) -> None:
+        """Start polling this port; disabled sensors are never added."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self.coordinator.async_want(self._kind, self._port))
+        await self.coordinator.async_request_refresh()
+
     @property
     def _ports(self) -> dict[int, bool]:
         data = self.coordinator.data
+        if data is None:
+            return {}
         return data.inputs if self._kind == CONNECTION_INPUT else data.outputs
 
     @property

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 import contextlib
 from dataclasses import dataclass, field
 from functools import partial
@@ -617,22 +617,31 @@ class WebHexTransport(WebTerminalTransport):
                 break
         return reply
 
-    async def get_connections(self) -> ConnectionState:
-        """Return which inputs have a source and which outputs have a display."""
+    async def get_connections(
+        self, ports: Iterable[tuple[str, int]] | None = None
+    ) -> ConnectionState:
+        """Return which inputs have a source and which outputs have a display.
+
+        ``ports`` limits the queries to those (kind, port) pairs; by default
+        every input and output is asked.
+        """
+        if ports is None:
+            ports = [
+                (kind, port)
+                for kind in (CONNECTION_INPUT, CONNECTION_OUTPUT)
+                for port in range(1, self.num_outputs + 1)
+            ]
         state = ConnectionState()
-        for kind, ports in (
-            (CONNECTION_INPUT, state.inputs),
-            (CONNECTION_OUTPUT, state.outputs),
-        ):
-            for port in range(1, self.num_outputs + 1):
-                matcher = partial(connection_byte, kind=kind, port=port)
-                reply = await self.exchange_frame(
-                    connection_frame(kind, port), match=matcher
-                )
-                value = matcher(parse_frames(reply))
-                state.raw[f"{kind}_{port}"] = None if value is None else f"{value:02x}"
-                if value is not None:
-                    ports[port] = connection_from_byte(kind, value)
+        for kind, port in ports:
+            matcher = partial(connection_byte, kind=kind, port=port)
+            reply = await self.exchange_frame(
+                connection_frame(kind, port), match=matcher
+            )
+            value = matcher(parse_frames(reply))
+            state.raw[f"{kind}_{port}"] = None if value is None else f"{value:02x}"
+            if value is not None:
+                results = state.inputs if kind == CONNECTION_INPUT else state.outputs
+                results[port] = connection_from_byte(kind, value)
         return state
 
     async def query_output(self, output: int) -> int | None:
@@ -811,12 +820,14 @@ class BlackbirdMatrix:
         async with self._lock:
             return await self._transport.get_state()
 
-    async def async_get_connections(self) -> ConnectionState:
+    async def async_get_connections(
+        self, ports: Iterable[tuple[str, int]] | None = None
+    ) -> ConnectionState:
         """Return which inputs and outputs have something connected."""
         if not isinstance(self._transport, WebHexTransport):
             raise BlackbirdProtocolError("Connection status isn't supported")
         async with self._lock:
-            return await self._transport.get_connections()
+            return await self._transport.get_connections(ports)
 
     async def async_set_output(self, output: int, input_: int) -> None:
         """Route ``input_`` to ``output``."""

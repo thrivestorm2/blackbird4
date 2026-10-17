@@ -36,9 +36,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: BlackbirdConfigEntry) ->
     )
     coordinator = BlackbirdCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()
-    if coordinator.connections is not None:
-        # Connection status is a nice-to-have: don't block setup on it.
-        await coordinator.connections.async_refresh()
     entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

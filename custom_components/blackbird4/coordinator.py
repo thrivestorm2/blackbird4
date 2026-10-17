@@ -7,8 +7,9 @@ from datetime import timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import BlackbirdError, BlackbirdMatrix, ConnectionState, MatrixState
@@ -114,8 +115,9 @@ class BlackbirdCoordinator(DataUpdateCoordinator[MatrixState]):
 class ConnectionCoordinator(DataUpdateCoordinator[ConnectionState]):
     """Poll which ports have something plugged in.
 
-    Kept separate and slow: it costs eight round trips, and cables change
-    far less often than routes.
+    Kept separate and slow: each port costs a round trip, and cables change
+    far less often than routes. Only ports whose sensors are enabled are
+    asked, and nothing is polled while every sensor is disabled.
     """
 
     config_entry: BlackbirdConfigEntry
@@ -133,11 +135,29 @@ class ConnectionCoordinator(DataUpdateCoordinator[ConnectionState]):
             config_entry=entry,
             name=f"{DOMAIN} connections",
             update_interval=CONNECTION_SCAN_INTERVAL,
+            # Sensors register as they're added; gather them into one poll.
+            request_refresh_debouncer=Debouncer(
+                hass, _LOGGER, cooldown=1, immediate=False
+            ),
         )
         self.client = client
+        self._wanted: set[tuple[str, int]] = set()
+
+    @callback
+    def async_want(self, kind: str, port: int) -> CALLBACK_TYPE:
+        """Poll this port until the returned callback is called."""
+        self._wanted.add((kind, port))
+
+        @callback
+        def _unwant() -> None:
+            self._wanted.discard((kind, port))
+
+        return _unwant
 
     async def _async_update_data(self) -> ConnectionState:
+        if not self._wanted:
+            return self.data or ConnectionState()
         try:
-            return await self.client.async_get_connections()
+            return await self.client.async_get_connections(sorted(self._wanted))
         except BlackbirdError as err:
             raise UpdateFailed(f"Error reading connection status: {err}") from err
