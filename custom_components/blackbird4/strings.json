@@ -20,6 +20,20 @@
           "port": "Port"
         },
         "description": "{details}"
+      },
+      "names": {
+        "title": "Name your inputs and outputs",
+        "description": "Optional: give the sources and displays friendly names, such as \"Apple TV\" or \"Living Room TV\". Leave any field blank to keep its default name (\"Input 1\", \"Output 1\", ...). You can change these later under Configure.",
+        "data": {
+          "input_1": "Input 1 name",
+          "input_2": "Input 2 name",
+          "input_3": "Input 3 name",
+          "input_4": "Input 4 name",
+          "output_1": "Output 1 name",
+          "output_2": "Output 2 name",
+          "output_3": "Output 3 name",
+          "output_4": "Output 4 name"
+        }
       }
     },
     "error": {

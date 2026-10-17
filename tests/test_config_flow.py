@@ -34,6 +34,13 @@ def _client_cls(behaviour):
     return factory
 
 
+async def _skip_names(hass: HomeAssistant, result):
+    """Submit the optional names step blank."""
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "names"
+    return await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+
 async def _start(hass: HomeAssistant):
     return await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -48,6 +55,7 @@ async def test_user_flow_http(hass: HomeAssistant, mock_client) -> None:
             result["flow_id"], {"host": " 192.168.1.39 ", "port": 80}
         )
         await hass.async_block_till_done()
+        result = await _skip_names(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {"host": "192.168.1.39", "port": 80, "protocol": "http"}
     assert result["result"].unique_id == "192.168.1.39"
@@ -65,6 +73,7 @@ async def test_user_flow_falls_back_to_tcp(hass: HomeAssistant, mock_client) -> 
             result["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
         await hass.async_block_till_done()
+        result = await _skip_names(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {"host": "192.168.1.39", "port": 4001, "protocol": "tcp"}
 
@@ -181,6 +190,7 @@ async def test_user_flow_detects_json(hass: HomeAssistant, mock_client) -> None:
             result["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
         await hass.async_block_till_done()
+        result = await _skip_names(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {"host": "192.168.1.39", "port": 80, "protocol": "json"}
 
@@ -197,6 +207,7 @@ async def test_user_flow_detects_web_terminal(hass: HomeAssistant, mock_client) 
             result["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
         await hass.async_block_till_done()
+        result = await _skip_names(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {
         "host": "192.168.1.39",
@@ -217,6 +228,7 @@ async def test_user_flow_detects_web_hex(hass: HomeAssistant, mock_client) -> No
             result["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
         await hass.async_block_till_done()
+        result = await _skip_names(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["protocol"] == "web_hex"
 
@@ -241,4 +253,40 @@ async def test_retry_while_earlier_attempt_open(
             second["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
         await hass.async_block_till_done()
+        second = await _skip_names(hass, second)
     assert second["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_names_step(hass: HomeAssistant, mock_client) -> None:
+    result = await _start(hass)
+    with patch(DETECT_CLIENT, _client_cls(lambda protocol, port: MatrixState({1: 1}))):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"host": "192.168.1.39", "port": 80}
+        )
+    assert result["step_id"] == "names"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"input_1": " Apple TV ", "input_2": "", "output_3": "Bedroom"},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["result"].options == {"input_1": "Apple TV", "output_3": "Bedroom"}
+    state = hass.states.get("media_player.blackbird_4x4_bedroom")
+    assert state.attributes["source_list"] == [
+        "Apple TV",
+        "Input 2",
+        "Input 3",
+        "Input 4",
+    ]
+
+
+async def test_names_step_skipped(hass: HomeAssistant, mock_client) -> None:
+    result = await _start(hass)
+    with patch(DETECT_CLIENT, _client_cls(lambda protocol, port: MatrixState({1: 1}))):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"host": "192.168.1.39", "port": 80}
+        )
+    result = await _skip_names(hass, result)
+    await hass.async_block_till_done()
+    assert result["result"].options == {}
+    assert hass.states.get("media_player.blackbird_4x4_output_1") is not None

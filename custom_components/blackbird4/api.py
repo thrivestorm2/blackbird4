@@ -36,8 +36,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections.abc import Callable, Iterable
 import contextlib
 from dataclasses import dataclass, field
+from functools import partial
 import json
 import re
 from typing import Any
@@ -464,6 +466,47 @@ def routed_input(frames: list[bytes], output: int) -> int | None:
     return None
 
 
+CONNECTION_INPUT = "input"
+CONNECTION_OUTPUT = "output"
+# A5 5B 01 04 <port> asks whether an input has a source plugged in;
+# A5 5B 01 05 <port> asks whether an output has a display (HPD).
+_CONNECTION_COMMANDS = {CONNECTION_INPUT: 0x04, CONNECTION_OUTPUT: 0x05}
+
+
+@dataclass
+class ConnectionState:
+    """Which ports have something connected; None if the matrix didn't say."""
+
+    inputs: dict[int, bool] = field(default_factory=dict)
+    outputs: dict[int, bool] = field(default_factory=dict)
+    raw: dict[str, str | None] = field(default_factory=dict)
+
+
+def connection_frame(kind: str, port: int) -> bytes:
+    """Return the frame asking for a port's connection status."""
+    return build_frame(bytes([0xA5, 0x5B, 0x01, _CONNECTION_COMMANDS[kind], port]))
+
+
+def connection_byte(frames: list[bytes], kind: str, port: int) -> int | None:
+    """Return the status byte of the newest reply for this port.
+
+    Vendor sheets put it in byte 6 or byte 7, so take whichever is set.
+    """
+    command = bytes([0x01, _CONNECTION_COMMANDS[kind]])
+    for frame in reversed(frames):
+        if frame[2:4] == command and frame[4] == port:
+            return frame[5] or frame[6]
+    return None
+
+
+def connection_from_byte(kind: str, value: int) -> bool:
+    """Interpret a status byte: inputs report FF when a source is plugged
+    in; outputs report FF when hot-plug detect is low (no display)."""
+    if kind == CONNECTION_INPUT:
+        return value == 0xFF
+    return value != 0xFF
+
+
 async def _bang_set_output(transport: Any, output: int, input_: int) -> None:
     """Route with the bang command set, falling back to the short form."""
     for command in bang_route_commands(output, input_):
@@ -542,13 +585,20 @@ class WebHexTransport(WebTerminalTransport):
         super().__init__(host, port, timeout)
         self.switch_order: str | None = None
 
-    async def exchange_frame(self, frame: bytes, output: int | None = None) -> str:
+    async def exchange_frame(
+        self,
+        frame: bytes,
+        output: int | None = None,
+        match: Callable[[list[bytes]], Any] | None = None,
+    ) -> str:
         """Send a frame and return the reply text.
 
         The reply buffer keeps its last content, so wait for it to change.
         When ``output`` is given, also wait for a routing reply for that
-        output.
+        output; when ``match`` is given, wait until it returns non-None.
         """
+        if output is not None:
+            match = partial(routed_input, output=output)
         before = await self._query()
         with contextlib.suppress(BlackbirdTimeoutError):
             parse_http_response(
@@ -562,10 +612,37 @@ class WebHexTransport(WebTerminalTransport):
             await asyncio.sleep(self.reply_delay)
             reply = await self._query()
             if reply != before and (
-                output is None or routed_input(parse_frames(reply), output) is not None
+                match is None or match(parse_frames(reply)) is not None
             ):
                 break
         return reply
+
+    async def get_connections(
+        self, ports: Iterable[tuple[str, int]] | None = None
+    ) -> ConnectionState:
+        """Return which inputs have a source and which outputs have a display.
+
+        ``ports`` limits the queries to those (kind, port) pairs; by default
+        every input and output is asked.
+        """
+        if ports is None:
+            ports = [
+                (kind, port)
+                for kind in (CONNECTION_INPUT, CONNECTION_OUTPUT)
+                for port in range(1, self.num_outputs + 1)
+            ]
+        state = ConnectionState()
+        for kind, port in ports:
+            matcher = partial(connection_byte, kind=kind, port=port)
+            reply = await self.exchange_frame(
+                connection_frame(kind, port), match=matcher
+            )
+            value = matcher(parse_frames(reply))
+            state.raw[f"{kind}_{port}"] = None if value is None else f"{value:02x}"
+            if value is not None:
+                results = state.inputs if kind == CONNECTION_INPUT else state.outputs
+                results[port] = connection_from_byte(kind, value)
+        return state
 
     async def query_output(self, output: int) -> int | None:
         """Return the input routed to ``output``, or None if it didn't say."""
@@ -733,10 +810,24 @@ class BlackbirdMatrix:
         """Return the protocol in use."""
         return self._transport.protocol
 
+    @property
+    def supports_connections(self) -> bool:
+        """Whether the matrix can report which ports have something plugged in."""
+        return isinstance(self._transport, WebHexTransport)
+
     async def async_get_state(self) -> MatrixState:
         """Return the current routing."""
         async with self._lock:
             return await self._transport.get_state()
+
+    async def async_get_connections(
+        self, ports: Iterable[tuple[str, int]] | None = None
+    ) -> ConnectionState:
+        """Return which inputs and outputs have something connected."""
+        if not isinstance(self._transport, WebHexTransport):
+            raise BlackbirdProtocolError("Connection status isn't supported")
+        async with self._lock:
+            return await self._transport.get_connections(ports)
 
     async def async_set_output(self, output: int, input_: int) -> None:
         """Route ``input_`` to ``output``."""
@@ -808,6 +899,53 @@ async def _probe_post(
     lines.append(f"POST {path} {body[:40]}: {_first_line(raw)}")
     if reply.strip():
         lines.append(f"  {_snippet(reply, 300)}")
+
+
+# Words and byte patterns around which the web UI's scripts build commands.
+_COMMAND_CODE_RE = re.compile(
+    r"power|beep|standby|0xa5|a5\s*,\s*5b|165\s*,\s*91|hex\(", re.IGNORECASE
+)
+
+
+async def async_web_ui_command_code(
+    host: str, port: int, timeout: float = 3.0, limit: int = 80
+) -> list[str]:
+    """Quote the web UI's script code that builds device commands.
+
+    Used by diagnostics to find the exact frames for functions such as
+    power and beep on firmware whose commands aren't documented.
+    """
+    http = HttpTransport(host, port, timeout)
+    try:
+        index = parse_http_response(await http.request("GET", "/"))
+    except BlackbirdError as err:
+        return [f"GET /: {err}"]
+    scripts = []
+    for match in _REF_RE.finditer(index):
+        ref = next(group for group in match.groups() if group)
+        ref = "/" + ref.lstrip("./").split("?")[0].lstrip("/")
+        if ref.endswith(".js") and "jquery" not in ref.lower() and ref not in scripts:
+            scripts.append(ref)
+    snippets: list[str] = []
+    for path in ["/", *scripts]:
+        try:
+            body = (
+                index
+                if path == "/"
+                else parse_http_response(await http.request("GET", path))
+            )
+        except BlackbirdError as err:
+            snippets.append(f"[{path}] {err}")
+            continue
+        last_end = -1
+        for match in _COMMAND_CODE_RE.finditer(body):
+            if match.start() < last_end:
+                continue
+            start, last_end = max(0, match.start() - 150), match.end() + 250
+            snippets.append(f"[{path}] {_snippet(body[start:last_end], 400)}")
+            if len(snippets) >= limit:
+                return snippets
+    return snippets
 
 
 async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:

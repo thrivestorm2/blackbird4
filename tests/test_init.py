@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 import pytest
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
 )
 
-from custom_components.blackbird4.api import BlackbirdConnectionError
+from custom_components.blackbird4.api import (
+    BlackbirdConnectionError,
+    ConnectionState,
+)
 from custom_components.blackbird4.const import DOMAIN
 from custom_components.blackbird4.diagnostics import (
     async_get_config_entry_diagnostics,
@@ -121,6 +126,157 @@ async def test_unload(hass: HomeAssistant, loaded) -> None:
 
 
 async def test_diagnostics(hass: HomeAssistant, loaded) -> None:
-    diag = await async_get_config_entry_diagnostics(hass, loaded)
+    with patch(
+        "custom_components.blackbird4.diagnostics.async_web_ui_command_code",
+        return_value=["[/js/x.js] power"],
+    ):
+        diag = await async_get_config_entry_diagnostics(hass, loaded)
+    assert diag["web_ui_command_code"] == ["[/js/x.js] power"]
+    assert diag["connections"] is None
     assert diag["routes"] == {1: 1, 2: 2, 3: 3, 4: 4}
     assert diag["raw_status"] == {"Outputbuttom": [1, 2, 3, 4]}
+
+
+async def test_no_connection_sensors_without_support(
+    hass: HomeAssistant, loaded
+) -> None:
+    assert not hass.states.async_entity_ids("binary_sensor")
+
+
+async def _setup_with_connections(hass, config_entry, mock_client, freezer):
+    mock_client.supports_connections = True
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    # Sensors' first poll is gathered into one after a short delay.
+    freezer.tick(timedelta(seconds=2))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+
+async def test_connection_sensors(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_client,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    mock_client.async_get_connections.return_value = ConnectionState(
+        inputs={1: True, 2: True, 3: True, 4: False},
+        outputs={1: False, 2: True, 3: True},
+        raw={"output_1": "ff", "output_2": "00"},
+    )
+    await _setup_with_connections(hass, config_entry, mock_client, freezer)
+    # One poll for all eight sensors.
+    mock_client.async_get_connections.assert_awaited_once()
+    assert len(mock_client.async_get_connections.await_args.args[0]) == 8
+
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_1_connected").state == "on"
+    )
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_4_connected").state == "off"
+    )
+    output_1 = hass.states.get("binary_sensor.blackbird_4x4_output_1_connected")
+    assert output_1.state == "off"
+    assert output_1.attributes["status_byte"] == "ff"
+    # Not reported by the matrix.
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_output_4_connected").state
+        == STATE_UNAVAILABLE
+    )
+
+
+async def test_connection_status_failure_does_not_block_setup(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_client,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    mock_client.async_get_connections.side_effect = BlackbirdConnectionError("x")
+    await _setup_with_connections(hass, config_entry, mock_client, freezer)
+    assert hass.states.get("media_player.blackbird_4x4_output_1").state == STATE_ON
+    assert (
+        hass.states.get("binary_sensor.blackbird_4x4_input_1_connected").state
+        == STATE_UNAVAILABLE
+    )
+
+
+def _disable(
+    hass: HomeAssistant, entry: MockConfigEntry, unique_ids: list[str]
+) -> None:
+    registry = er.async_get(hass)
+    for unique_id in unique_ids:
+        registry.async_get_or_create(
+            "binary_sensor",
+            DOMAIN,
+            f"{entry.entry_id}_{unique_id}_connected",
+            config_entry=entry,
+            disabled_by=er.RegistryEntryDisabler.USER,
+        )
+
+
+async def test_disabled_sensors_are_not_polled(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_client,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    config_entry.add_to_hass(hass)
+    _disable(
+        hass,
+        config_entry,
+        ["input_2", "input_3", "input_4", "output_1", "output_2", "output_3"],
+    )
+    await _setup_with_connections(hass, config_entry, mock_client, freezer)
+    polled = mock_client.async_get_connections.await_args.args[0]
+    assert sorted(polled) == [("input", 1), ("output", 4)]
+
+
+async def test_nothing_polled_when_all_sensors_disabled(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_client,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    config_entry.add_to_hass(hass)
+    _disable(
+        hass,
+        config_entry,
+        [f"{kind}_{port}" for kind in ("input", "output") for port in range(1, 5)],
+    )
+    await _setup_with_connections(hass, config_entry, mock_client, freezer)
+    freezer.tick(timedelta(minutes=5))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    mock_client.async_get_connections.assert_not_awaited()
+    # Routing keeps working.
+    assert hass.states.get("media_player.blackbird_4x4_output_1").state == STATE_ON
+
+
+async def test_upgrade_keeps_entity_ids(
+    hass: HomeAssistant, config_entry: MockConfigEntry, mock_client
+) -> None:
+    """An entry from an older version keeps its entities, including renamed ones."""
+    config_entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    # Entities as an older version registered them, one renamed by the user.
+    registry.async_get_or_create(
+        "media_player",
+        DOMAIN,
+        f"{config_entry.entry_id}_output_1_media_player",
+        config_entry=config_entry,
+        suggested_object_id="living_room_tv",
+    )
+    registry.async_get_or_create(
+        "select",
+        DOMAIN,
+        f"{config_entry.entry_id}_output_1_select",
+        config_entry=config_entry,
+        suggested_object_id="blackbird_4x4_output_1_source",
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("media_player.living_room_tv") is not None
+    assert hass.states.get("select.blackbird_4x4_output_1_source") is not None
+    assert hass.states.get("media_player.blackbird_4x4_output_1") is None
+    assert config_entry.options == {}

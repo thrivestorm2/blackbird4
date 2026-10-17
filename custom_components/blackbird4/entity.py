@@ -9,6 +9,18 @@ from .const import DOMAIN, MANUFACTURER, MODEL
 from .coordinator import BlackbirdCoordinator
 
 
+def device_info(coordinator: BlackbirdCoordinator) -> DeviceInfo:
+    """Return the matrix's device info, shared by every entity."""
+    entry = coordinator.config_entry
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry.entry_id)},
+        manufacturer=MANUFACTURER,
+        model=MODEL,
+        name=entry.title,
+        configuration_url=f"http://{coordinator.client.host}",
+    )
+
+
 class BlackbirdOutputEntity(CoordinatorEntity[BlackbirdCoordinator]):
     """An entity representing one output of the matrix."""
 
@@ -22,13 +34,7 @@ class BlackbirdOutputEntity(CoordinatorEntity[BlackbirdCoordinator]):
         self._output = output
         entry = coordinator.config_entry
         self._attr_unique_id = f"{entry.entry_id}_output_{output}_{kind}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name=entry.title,
-            configuration_url=f"http://{coordinator.client.host}",
-        )
+        self._attr_device_info = device_info(coordinator)
 
     @property
     def available(self) -> bool:

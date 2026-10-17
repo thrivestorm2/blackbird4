@@ -12,7 +12,11 @@ from .const import CONF_PROTOCOL, DOMAIN
 from .coordinator import BlackbirdConfigEntry, BlackbirdCoordinator
 from .services import async_setup_services
 
-PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER, Platform.SELECT]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.MEDIA_PLAYER,
+    Platform.SELECT,
+]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
