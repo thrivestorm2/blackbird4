@@ -11,6 +11,7 @@ from custom_components.blackbird4.api import (
     BlackbirdConnectionError,
     BlackbirdMatrix,
     BlackbirdProtocolError,
+    async_probe,
     parse_http_response,
     parse_status_body,
     route_command,
@@ -164,3 +165,25 @@ async def test_tcp_transport(device) -> None:
     assert fake.received[0] == b"Status.\r\n"
     await client.async_send_raw("PowerOFF")
     assert fake.received[1] == b"PowerOFF.\r\n"
+
+
+async def test_probe_reports_endpoints(device) -> None:
+    pages = {
+        b"GET / ": b'<html><frameset><frame src="main.html"></frameset></html>',
+        b"GET /main.html ": b'<script src="js/app.js"></script>',
+        b"GET /js/app.js ": b'$.post("/cgi-bin/query.cgi", "{CMD=OUT"+o+":"+i+".");',
+    }
+
+    def reply(request: bytes) -> bytes:
+        for prefix, body in pages.items():
+            if request.startswith(prefix):
+                return b"HTTP/1.1 200 OK\n\n" + body
+        return b"HTTP/1.1 404 Not Found\r\n\r\n"
+
+    fake = await device(reply)
+    report = await async_probe("127.0.0.1", fake.port)
+    assert "GET /main.html: HTTP/1.1 200 OK" in report
+    assert "GET /js/app.js: HTTP/1.1 200 OK" in report
+    assert "CGI endpoints: /cgi-bin/query.cgi" in report
+    assert "CMD=OUT" in report
+    assert "POST /cgi-bin/MUH44TP_getsetparams.cgi: HTTP/1.1 404 Not Found" in report

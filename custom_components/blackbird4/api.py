@@ -149,8 +149,12 @@ class HttpTransport:
         self.timeout = timeout
 
     async def _post(self, path: str, body: str) -> str:
+        return parse_http_response(await self.request("POST", path, body))
+
+    async def request(self, method: str, path: str, body: str = "") -> bytes:
+        """Send a request and return the raw response, headers included."""
         request = (
-            f"POST {path} HTTP/1.1\r\n"
+            f"{method} {path} HTTP/1.1\r\n"
             f"Host: {self.host}\r\n"
             "Accept: */*\r\n"
             "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -174,7 +178,7 @@ class HttpTransport:
             raise BlackbirdConnectionError(
                 f"Cannot reach {self.host}:{self.port}: {err}"
             ) from err
-        return parse_http_response(response)
+        return response
 
     async def get_state(self) -> MatrixState:
         """Return the current routing."""
@@ -287,3 +291,74 @@ class BlackbirdMatrix:
         """Send an arbitrary RS-232 command and return the reply text."""
         async with self._lock:
             return await self._transport.send(command)
+
+
+_REF_RE = re.compile(
+    r"""(?:src|href|action|url)\s*[=:(]\s*["']?([\w./?=&-]+\.(?:cgi|js|html?|asp|php)[\w?=&]*)"""
+    r"""|location(?:\.href)?\s*=\s*["']([^"']+)["']"""
+    r"""|["']([\w./-]+\.cgi)["']""",
+    re.IGNORECASE,
+)
+_CMD_RE = re.compile(r"""CMD=[^"'<>\s]{0,40}|\{[A-Z]{3,}[=:][^"'<>]{0,30}""")
+
+
+def _first_line(response: bytes) -> str:
+    return response.decode("utf-8", errors="replace").split("\n", 1)[0].strip()
+
+
+def _snippet(text: str, limit: int = 200) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+async def async_probe(host: str, port: int, timeout: float = 3.0) -> str:
+    """Describe what the web server at host:port serves, for unsupported firmware.
+
+    Fetches the index page and a few pages/scripts it references, and lists
+    the CGI endpoints and command strings they mention, plus the reply to the
+    status request this integration expects.
+    """
+    http = HttpTransport(host, port, timeout)
+    lines: list[str] = []
+    cgis: set[str] = set()
+    cmds: set[str] = set()
+    queue = ["/"]
+    seen: set[str] = set()
+    while queue and len(seen) < 6:
+        path = queue.pop(0)
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            raw = await http.request("GET", path)
+        except BlackbirdConnectionError as err:
+            lines.append(f"GET {path}: {err}")
+            continue
+        try:
+            body = parse_http_response(raw)
+        except BlackbirdProtocolError:
+            body = ""
+        lines.append(f"GET {path}: {_first_line(raw)} ({len(body)} bytes)")
+        if path == "/":
+            lines.append(f"  {_snippet(body)}")
+        for match in _REF_RE.finditer(body):
+            ref = next(group for group in match.groups() if group)
+            ref = "/" + ref.lstrip("./").split("?")[0].lstrip("/")
+            if ref.lower().endswith(".cgi"):
+                cgis.add(ref)
+            elif ref not in seen and not ref.lower().endswith((".png", ".jpg")):
+                queue.append(ref)
+        cmds.update(_CMD_RE.findall(body))
+    lines.append("CGI endpoints: " + (", ".join(sorted(cgis)) or "none found"))
+    lines.append("Command strings: " + (", ".join(sorted(cmds)[:15]) or "none found"))
+    try:
+        raw = await http.request("POST", STATUS_PATH, STATUS_BODY)
+        try:
+            body = parse_http_response(raw)
+        except BlackbirdProtocolError:
+            body = ""
+        lines.append(f"POST {STATUS_PATH}: {_first_line(raw)}")
+        lines.append(f"  {_snippet(body)}")
+    except BlackbirdConnectionError as err:
+        lines.append(f"POST {STATUS_PATH}: {err}")
+    return "\n".join(lines)

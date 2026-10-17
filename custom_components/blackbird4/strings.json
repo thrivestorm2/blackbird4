@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Monoprice Blackbird 4x4",
-        "description": "Enter the address of the matrix's web interface. If the web interface can't be used, nearby TCP control ports are tried automatically.",
+        "description": "Enter the address of the matrix's web interface. If the web interface can't be used, nearby TCP control ports are tried automatically.{details}",
         "data": {
           "host": "Host",
           "port": "Port"
@@ -18,12 +18,13 @@
         "data": {
           "host": "Host",
           "port": "Port"
-        }
+        },
+        "description": "{details}"
       }
     },
     "error": {
       "cannot_connect": "Could not connect to the matrix. Check the IP address and that it is on the network.",
-      "unknown_protocol": "Something answered at that address but it didn't respond like a Blackbird matrix. Run scripts/probe.py from the repository and open an issue with the output.",
+      "unknown_protocol": "Something answered at that address but it didn't respond like a supported Blackbird matrix. The device's reply is shown above; send it to the integration's GitHub issues.",
       "unknown": "Unexpected error"
     },
     "abort": {

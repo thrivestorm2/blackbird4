@@ -21,6 +21,7 @@ from .api import (
     BlackbirdConnectionError,
     BlackbirdError,
     BlackbirdMatrix,
+    async_probe,
 )
 from .const import (
     CONF_PROTOCOL,
@@ -87,6 +88,10 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    def __init__(self) -> None:
+        """Initialise the flow."""
+        self._details = ""
+
     async def _async_validate(
         self, user_input: dict[str, Any], errors: dict[str, str]
     ) -> dict[str, Any] | None:
@@ -96,10 +101,24 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
             errors["base"] = "cannot_connect"
         except UnknownProtocol:
             errors["base"] = "unknown_protocol"
+            await self._async_probe(user_input[CONF_HOST], user_input[CONF_PORT])
         except Exception:
             _LOGGER.exception("Unexpected error detecting Blackbird matrix")
             errors["base"] = "unknown"
         return None
+
+    async def _async_probe(self, host: str, port: int) -> None:
+        """Show what the device serves so unsupported firmware can be added."""
+        try:
+            report = await async_probe(host, port)
+        except Exception:
+            _LOGGER.exception("Probe of %s:%s failed", host, port)
+            return
+        _LOGGER.warning("Blackbird probe of %s:%s:\n%s", host, port, report)
+        self._details = (
+            "\n\n**What the device replied** (copy this into a GitHub issue):"
+            f"\n```\n{report[:2500]}\n```"
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -116,6 +135,7 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=self.add_suggested_values_to_schema(_user_schema(), user_input),
             errors=errors,
+            description_placeholders={"details": self._details},
         )
 
     async def async_step_reconfigure(
@@ -136,6 +156,7 @@ class BlackbirdConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure",
             data_schema=_user_schema(entry.data[CONF_HOST], entry.data[CONF_PORT]),
             errors=errors,
+            description_placeholders={"details": self._details},
         )
 
     @staticmethod

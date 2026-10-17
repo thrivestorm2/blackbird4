@@ -80,20 +80,27 @@ async def test_user_flow_errors(hass: HomeAssistant) -> None:
         )
     assert result["errors"] == {"base": "cannot_connect"}
 
-    with patch(
-        DETECT_CLIENT,
-        _client_cls(
-            lambda protocol, port: (
-                BlackbirdProtocolError("?")
-                if protocol == "http"
-                else BlackbirdConnectionError("down")
-            )
+    with (
+        patch(
+            DETECT_CLIENT,
+            _client_cls(
+                lambda protocol, port: (
+                    BlackbirdProtocolError("?")
+                    if protocol == "http"
+                    else BlackbirdConnectionError("down")
+                )
+            ),
+        ),
+        patch(
+            "custom_components.blackbird4.config_flow.async_probe",
+            return_value="GET /: HTTP/1.1 200 OK",
         ),
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {"host": "192.168.1.39", "port": 80}
         )
     assert result["errors"] == {"base": "unknown_protocol"}
+    assert "GET /: HTTP/1.1 200 OK" in result["description_placeholders"]["details"]
 
 
 async def test_duplicate_aborts(
